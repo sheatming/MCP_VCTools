@@ -12,6 +12,8 @@
 
 ## 提供的工具
 
+### 文件与搜索
+
 | 工具               | 作用                                 |
 | ---------------- | ---------------------------------- |
 | `read_file`      | 读取文本文件（UTF-8，自动识别 BOM）             |
@@ -20,10 +22,33 @@
 | `list_directory` | 列出目录条目                             |
 | `search_files`   | 递归搜索文件内容（跳过 node_modules/.git/二进制） |
 | `diff_files`     | 对比两个文件差异（unified diff 格式）          |
+
+### git 版本控制
+
+| 工具               | 作用                                 |
+| ---------------- | ---------------------------------- |
 | `git`            | 执行任意 git 子命令（安全封装，禁 shell）          |
-| `git_status`     | 查看工作区状态（等价 git status --short --branch）|
-| `git_log`        | 查看提交历史（oneline 格式）                |
+| `git_status`     | 查看工作区状态（status --short --branch）    |
+| `git_log`        | 查看提交历史（oneline）                     |
+| `git_diff`       | 查看未暂存/暂存区差异                        |
+| `git_add`        | 暂存文件（git add）                       |
+| `git_commit`     | 提交暂存改动（git commit -m）                |
+
+### 构建 / 测试 / 依赖
+
+| 工具               | 作用                                 |
+| ---------------- | ---------------------------------- |
+| `install_deps`   | 自动探测包管理器并安装依赖（npm/yarn/pnpm/pip/poetry/uv/cargo） |
+| `run_tests`      | 自动探测测试框架并运行（pytest/jest/vitest/go/cargo） |
+| `run_lint`       | 自动探测并运行 lint/格式化（ruff/eslint/prettier）  |
 | `run_command`    | 执行命令行（需显式开启，带超时与退出码）            |
+
+### 项目感知与开发上下文
+
+| 工具               | 作用                                 |
+| ---------------- | ---------------------------------- |
+| `get_project_info`| 识别语言、包管理器、测试框架、目录结构             |
+| `load_dev_context`| 加载项目预制开发上下文（技术文档/规范/进度等）       |
 
 ## 环境要求
 
@@ -67,6 +92,29 @@ python -m venv .venv
 - 命令交给系统 shell 解析：Windows 上是 `cmd.exe`，Linux/macOS 上是 `sh`，请按对应平台写命令语法。
 
 > ⚠️ 开启后，AI 助手将具备在你机器上执行任意命令的能力，请仅在可信环境使用。
+
+## 预制开发流程（dev-context）
+
+为避免每次开发都要反复口头交代、防止遗漏规范，支持在**任意项目根目录**放一个 `.dev-context/` 目录，里面放技术文档、开发规范、构建规范、开发进度等 Markdown 文件。
+
+AI 开发时会用 `load_dev_context` 工具自动读取这些文件作为上下文，形成固定开发流程：
+
+1. `load_dev_context` —— 读技术文档 / 规范 / 进度
+2. `get_project_info` —— 识别语言、包管理器、目录结构
+3. 改代码 → `install_deps` → `run_lint` → `run_tests`
+4. `git_diff` 回看 → `git_add` + `git_commit` 提交
+
+```
+你的项目/
+├── .dev-context/
+│   ├── 技术文档.md
+│   ├── 开发规范.md
+│   ├── 构建规范.md
+│   └── 开发进度.md
+└── ...
+```
+
+完整的模板和说明见 `docs/dev-context-guide.md` 与 `docs/templates/` 目录。
 
 ## 接入 WorkBuddy
 

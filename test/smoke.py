@@ -156,7 +156,60 @@ async def test_git_tools():
             print("[git rev ]", _text(r).strip()[:50])
 
 
+async def test_git_commit_and_context():
+    """第四个场景：验证 git commit 全套 + 项目感知 + dev-context。"""
+    import subprocess as sp
+
+    here = Path(__file__).resolve().parent.parent
+    server_py = here / "server.py"
+    python = here / ".venv" / "Scripts" / "python.exe"
+    if not python.exists():
+        python = here / ".venv" / "bin" / "python"
+
+    repo = tempfile.mkdtemp(prefix="coding-mcp-git2-")
+    sp.run(["git", "init", "-q", repo], check=True)
+    sp.run(["git", "-C", repo, "config", "user.name", "test"], check=True)
+    sp.run(["git", "-C", repo, "config", "user.email", "test@example.com"], check=True)
+
+    # 造一个 Python 项目标记 + dev-context
+    Path(repo, "requirements.txt").write_text("mcp>=1.0\n", encoding="utf-8")
+    ctx_dir = Path(repo, ".dev-context")
+    ctx_dir.mkdir()
+    (ctx_dir / "技术文档.md").write_text("# 技术文档\n这是一个测试项目。\n", encoding="utf-8")
+    (ctx_dir / "开发规范.md").write_text("# 开发规范\n提交前必须跑测试。\n", encoding="utf-8")
+
+    params = StdioServerParameters(command=str(python), args=[str(server_py)])
+
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print("\ntools:", ", ".join(t.name for t in tools.tools))
+
+            r = await session.call_tool("get_project_info", {"cwd": repo})
+            print("\n[project ]")
+            print(_text(r))
+
+            r = await session.call_tool("load_dev_context", {"cwd": repo})
+            print("\n[context ]")
+            print(_text(r))
+
+            # git add + commit
+            r = await session.call_tool("git_add", {"paths": ["."], "cwd": repo})
+            print("[git_add ]", _text(r).strip()[:60])
+
+            r = await session.call_tool("git_diff", {"cwd": repo, "staged": True})
+            print("[git_diff]", _text(r).strip()[:100])
+
+            r = await session.call_tool("git_commit", {"message": "feat: add project", "cwd": repo})
+            print("[commit  ]", _text(r).strip()[:80])
+
+            r = await session.call_tool("git_log", {"cwd": repo, "count": 3})
+            print("[log     ]", _text(r).strip()[:80])
+
+
 if __name__ == "__main__":
     asyncio.run(main())
     asyncio.run(test_exec_disabled_by_default())
     asyncio.run(test_git_tools())
+    asyncio.run(test_git_commit_and_context())

@@ -112,6 +112,125 @@ def _git_output(args, cwd=None, timeout=30.0, limit=8000):
     return "\n".join(lines)
 
 
+def run_cmd(cmd, cwd=None, timeout=60.0):
+    """通用命令执行：禁 shell、参数列表，返回 (returncode, stdout_text, stderr_text)。"""
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout, shell=False)
+    except FileNotFoundError:
+        raise RuntimeError(f"未找到可执行文件：{cmd[0] if cmd else ''}")
+    def _dec(b):
+        try:
+            return b.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return str(b)
+    return proc.returncode, _dec(proc.stdout), _dec(proc.stderr)
+
+
+def _fmt_cmd_result(code, stdout, stderr, limit=8000):
+    """格式化命令执行结果为文本。"""
+    def _trim(s, limit=8000):
+        if len(s) <= limit:
+            return s
+        return s[:limit] + f"\n…（输出过长，已截断，共 {len(s)} 字符）"
+    out = _trim(stdout)
+    err = _trim(stderr)
+    lines = [f"退出码：{code}"]
+    if out:
+        lines.append(f"--- 标准输出 ---\n{out.rstrip(chr(10))}")
+    if err:
+        lines.append(f"--- 标准错误 ---\n{err.rstrip(chr(10))}")
+    if not out and not err:
+        lines.append("（无输出）")
+    return "\n".join(lines)
+
+
+# 项目探测：常见包管理器/测试框架/配置文件的标记文件
+_PM_MARKERS = [
+    ("pnpm", "pnpm-lock.yaml"),
+    ("yarn", "yarn.lock"),
+    ("npm", "package-lock.json"),
+    ("npm", "package.json"),
+    ("poetry", "pyproject.toml"),
+    ("uv", "uv.lock"),
+    ("pip", "requirements.txt"),
+    ("cargo", "Cargo.toml"),
+    ("go", "go.mod"),
+]
+
+_TEST_MARKERS = [
+    ("pytest", "pytest.ini"),
+    ("pytest", "tox.ini"),
+    ("jest", "jest.config.js"),
+    ("vitest", "vitest.config.ts"),
+    ("go test", "go.mod"),
+    ("cargo test", "Cargo.toml"),
+]
+
+
+def detect_project(root):
+    """探测项目根目录的语言/包管理器/测试框架。返回 dict。"""
+    info = {"root": root, "package_manager": None, "language": None, "test": None}
+    names = set(os.listdir(root)) if os.path.isdir(root) else set()
+
+    # 包管理器（优先级按 _PM_MARKERS 顺序）
+    for pm, marker in _PM_MARKERS:
+        if marker in names:
+            info["package_manager"] = pm
+            break
+
+    # 语言启发式
+    langs = []
+    if any(n in names for n in ("package.json", "tsconfig.json", "jsconfig.json", "vite.config.ts")):
+        langs.append("TypeScript/JavaScript")
+    if any(n in names for n in ("pyproject.toml", "requirements.txt", "setup.py", "Pipfile")):
+        langs.append("Python")
+    if "go.mod" in names:
+        langs.append("Go")
+    if "Cargo.toml" in names:
+        langs.append("Rust")
+    if "pom.xml" in names or "build.gradle" in names:
+        langs.append("Java/JVM")
+    if not langs and info["package_manager"]:
+        langs.append(info["package_manager"])
+    info["language"] = " / ".join(langs) or "未知"
+
+    # 测试框架
+    for tf, marker in _TEST_MARKERS:
+        if marker in names:
+            info["test"] = tf
+            break
+    return info
+
+
+def dev_context_dir(root):
+    """返回项目 dev-context 目录路径（不存在返回 None）。"""
+    candidates = [
+        os.path.join(root, ".dev-context"),
+        os.path.join(root, ".coding-mcp", "context"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
+
+def read_dev_context(root):
+    """加载开发上下文：返回 {文件名: 内容}。"""
+    d = dev_context_dir(root)
+    if not d:
+        return {}
+    result = {}
+    for name in sorted(os.listdir(d)):
+        full = os.path.join(d, name)
+        if os.path.isfile(full):
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    result[name] = f.read()
+            except OSError:
+                continue
+    return result
+
+
 def to_abs(p):
     if not isinstance(p, str) or not p.strip():
         raise ValueError("路径不能为空")
@@ -462,6 +581,215 @@ def git_log(count: int = 20, cwd: str = "") -> str:
         return out
     except Exception as e:  # noqa: BLE001
         log_op({"tool": "git_log", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def git_diff(cwd: str = "", staged: bool = False) -> str:
+    """查看工作区差异。cwd：仓库目录（可选）。staged：True 看暂存区差异，False 看未暂存差异（默认）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else None
+        args = ["diff", "--cached"] if staged else ["diff"]
+        log_op({"tool": "git_diff", "cwd": workdir, "staged": staged, "ok": None})
+        out = _git_output(args, cwd=workdir)
+        log_op({"tool": "git_diff", "cwd": workdir, "staged": staged, "ok": True})
+        return out
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "git_diff", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def git_add(paths: list[str], cwd: str = "") -> str:
+    """暂存文件（git add）。paths：要暂存的文件/目录路径列表（相对仓库，如 ["."] 暂存全部）。
+    cwd：仓库目录（可选）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else None
+        p = [str(x) for x in paths] if paths else ["."]
+        log_op({"tool": "git_add", "paths": p, "cwd": workdir, "ok": None})
+        out = _git_output(["add", *p], cwd=workdir)
+        log_op({"tool": "git_add", "paths": p, "cwd": workdir, "ok": True})
+        return out
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "git_add", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def git_commit(message: str, cwd: str = "") -> str:
+    """提交暂存的改动（git commit -m）。message：提交说明。cwd：仓库目录（可选）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else None
+        if not message or not str(message).strip():
+            return "错误：提交说明不能为空"
+        log_op({"tool": "git_commit", "message": message, "cwd": workdir, "ok": None})
+        out = _git_output(["commit", "-m", str(message)], cwd=workdir)
+        log_op({"tool": "git_commit", "message": message, "cwd": workdir, "ok": True})
+        return out
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "git_commit", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def install_deps(cwd: str = "") -> str:
+    """自动探测包管理器并安装依赖（pnpm/yarn/npm/poetry/uv/pip/cargo）。cwd：项目目录（可选）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
+        if not os.path.isdir(workdir):
+            return f"错误：目录不存在：{workdir}"
+        info = detect_project(workdir)
+        pm = info["package_manager"]
+        if not pm:
+            return f"错误：未识别到包管理器（目录 {workdir}）"
+        cmds = {
+            "pnpm": ["pnpm", "install"],
+            "yarn": ["yarn", "install"],
+            "npm": ["npm", "install"],
+            "poetry": ["poetry", "install"],
+            "uv": ["uv", "sync"],
+            "pip": ["pip", "install", "-r", "requirements.txt"],
+            "cargo": ["cargo", "build"],
+        }
+        cmd = cmds.get(pm)
+        if not cmd:
+            return f"错误：不支持的包管理器 {pm}"
+        log_op({"tool": "install_deps", "pm": pm, "cwd": workdir, "ok": None})
+        code, out, err = run_cmd(cmd, cwd=workdir, timeout=180.0)
+        log_op({"tool": "install_deps", "pm": pm, "cwd": workdir, "ok": code == 0})
+        return f"[包管理器 {pm}] 命令：{' '.join(cmd)}\n" + _fmt_cmd_result(code, out, err)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "install_deps", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def run_tests(cwd: str = "") -> str:
+    """自动探测测试框架并运行测试（pytest/jest/vitest/go test/cargo test）。cwd：项目目录（可选）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
+        if not os.path.isdir(workdir):
+            return f"错误：目录不存在：{workdir}"
+        info = detect_project(workdir)
+        tf = info["test"]
+        if not tf:
+            return f"错误：未识别到测试框架（目录 {workdir}）"
+        cmds = {
+            "pytest": ["python", "-m", "pytest", "-q"],
+            "jest": ["npx", "jest"],
+            "vitest": ["npx", "vitest", "run"],
+            "go test": ["go", "test", "./..."],
+            "cargo test": ["cargo", "test"],
+        }
+        cmd = cmds.get(tf)
+        if not cmd:
+            return f"错误：不支持的测试框架 {tf}"
+        log_op({"tool": "run_tests", "test": tf, "cwd": workdir, "ok": None})
+        code, out, err = run_cmd(cmd, cwd=workdir, timeout=180.0)
+        log_op({"tool": "run_tests", "test": tf, "cwd": workdir, "ok": code == 0})
+        return f"[测试 {tf}] 命令：{' '.join(cmd)}\n" + _fmt_cmd_result(code, out, err)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "run_tests", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def run_lint(cwd: str = "") -> str:
+    """自动探测并运行代码检查/格式化（ruff/black/eslint/prettier）。cwd：项目目录（可选）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
+        if not os.path.isdir(workdir):
+            return f"错误：目录不存在：{workdir}"
+        names = set(os.listdir(workdir))
+        candidates = []
+        if "ruff.toml" in names or "ruff" in names or any(n.startswith(".ruff") for n in names):
+            candidates.append(["ruff", "check", "."])
+        if "pyproject.toml" in names:
+            candidates.append(["ruff", "check", "."])
+        if ".eslintrc" in names or "eslint.config.js" in names or "eslint.config.mjs" in names:
+            candidates.append(["npx", "eslint", "."])
+        if ".prettierrc" in names or "prettier.config.js" in names:
+            candidates.append(["npx", "prettier", "--check", "."])
+        if not candidates:
+            # 兜底：Python 用 py_compile，JS 无则提示
+            if "package.json" in names:
+                candidates.append(["npx", "prettier", "--check", "."])
+            else:
+                return "错误：未识别到 lint/格式化工具（ruff/eslint/prettier）"
+        cmd = candidates[0]
+        log_op({"tool": "run_lint", "cmd": cmd, "cwd": workdir, "ok": None})
+        code, out, err = run_cmd(cmd, cwd=workdir, timeout=120.0)
+        log_op({"tool": "run_lint", "cmd": cmd, "cwd": workdir, "ok": code == 0})
+        return f"[lint] 命令：{' '.join(cmd)}\n" + _fmt_cmd_result(code, out, err)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "run_lint", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def get_project_info(cwd: str = "") -> str:
+    """识别项目概况：语言、包管理器、测试框架、目录结构、依赖清单。
+    cwd：项目目录（可选，默认当前目录）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
+        if not os.path.isdir(workdir):
+            return f"错误：目录不存在：{workdir}"
+        info = detect_project(workdir)
+        lines = [
+            f"项目根目录：{workdir}",
+            f"识别语言：{info['language']}",
+            f"包管理器：{info['package_manager'] or '未识别'}",
+            f"测试框架：{info['test'] or '未识别'}",
+        ]
+
+        # 目录结构（两层，跳过常见忽略目录）
+        def _tree(d, depth=0, max_depth=2):
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(os.listdir(d))
+            except OSError:
+                return
+            for name in entries:
+                if name in SKIP_DIRS or name.startswith("."):
+                    continue
+                full = os.path.join(d, name)
+                if os.path.isdir(full):
+                    lines.append("  " * depth + f"{name}/")
+                    _tree(full, depth + 1, max_depth)
+                else:
+                    lines.append("  " * depth + name)
+
+        lines.append("\n目录结构：")
+        _tree(workdir)
+        log_op({"tool": "get_project_info", "cwd": workdir, "ok": True})
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "get_project_info", "cwd": cwd, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def load_dev_context(cwd: str = "") -> str:
+    """加载项目预制开发上下文（技术文档/开发规范/构建规范/进度等）。开发前应优先调用。
+    上下文放在项目根的 .dev-context/ 目录下（.md 或 .txt），返回全部文件内容。
+    cwd：项目目录（可选，默认当前目录）。"""
+    try:
+        workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
+        ctx = read_dev_context(workdir)
+        if not ctx:
+            return (
+                "未找到预制开发上下文。请在项目根目录创建 .dev-context/ 目录，"
+                "放入技术文档、开发规范、构建规范、开发进度等 .md 文件，"
+                "开发时我会自动读取这些文件。"
+            )
+        parts = []
+        for name, content in ctx.items():
+            parts.append(f"===== {name} =====\n{content}")
+        log_op({"tool": "load_dev_context", "cwd": workdir, "ok": True, "files": list(ctx.keys())})
+        return "\n\n".join(parts)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "load_dev_context", "cwd": cwd, "ok": False, "error": str(e)})
         return f"错误：{e}"
 
 

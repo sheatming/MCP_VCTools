@@ -17,6 +17,11 @@
   MCP_ENABLE_EXEC=1             开启命令执行工具（默认关闭，需显式开启）
   MCP_EXEC_TIMEOUT=30           命令执行超时上限（秒，默认 30）
 
+服务注册表（GUI/后台服务托管）：
+  ~/.coding-mcp/services.json  注册表文件（JSON 列表）
+  ~/.coding-mcp/services/<name>/  每个服务的 pid/log 子目录
+  service_clean 扫描注册表，清理已死进程的孤儿条目
+
 数据库（可选，URL 格式，未设置则对应工具不可用）：
   MCP_MYSQL_URL=mysql://user:pass@host:3306/dbname
   MCP_PGSQL_URL=postgresql://user:pass@host:5432/dbname
@@ -33,10 +38,11 @@ import tempfile
 import datetime
 import subprocess
 import difflib
+import re
 
 from mcp.server.mcpserver import MCPServer
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -81,6 +87,14 @@ REDIS_URL = os.environ.get("MCP_REDIS_URL", "").strip()
 
 # 数据库写操作开关：默认只读，需设置 MCP_DB_ALLOW_WRITE=1 才允许写
 DB_ALLOW_WRITE = os.environ.get("MCP_DB_ALLOW_WRITE", "") in ("1", "true", "True")
+
+# 服务注册表：存放 ~/.coding-mcp/services.json + 每个服务的 pid/log 子目录
+# 默认沙箱在用户家目录下，不受 MCP_ALLOWED_ROOTS 约束（属于服务器内部状态，非用户项目）
+SERVICES_ROOT = os.path.join(str(os.path.expanduser("~")), ".coding-mcp", "services")
+SERVICES_REGISTRY = os.path.join(str(os.path.expanduser("~")), ".coding-mcp", "services.json")
+
+# 服务名白名单：仅允许字母/数字/./_/-，防止 shell/路径注入
+_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 # ---------------------------------------------------------------------------
 # 工具函数
@@ -880,7 +894,9 @@ def load_dev_context(cwd: str = "") -> str:
 def run_command(command: str, cwd: str = "", timeout: float = 0) -> str:
     """执行一条命令行并返回退出码、标准输出、标准错误。默认关闭，需设置 MCP_ENABLE_EXEC=1 才可用。
     command：要执行的命令（字符串，交给系统 shell 解析）。cwd：工作目录（可选，默认继承服务器进程目录）。
-    timeout：超时秒数（可选，默认 30，不得超过服务器上限 MCP_EXEC_TIMEOUT）。"""
+    timeout：超时秒数（可选，默认 30，不得超过服务器上限 MCP_EXEC_TIMEOUT）。
+    ⚠️ 本工具只适合"有明确结束点"的命令（编译、测试、git 等）。
+    拒绝后台化语法（start / nohup / setsid / disown / 末尾 & 等），请改用 launch_gui 或 service_start。"""
     if not EXEC_ENABLED:
         return "错误：命令执行未开启。请在启动服务器时设置 MCP_ENABLE_EXEC=1。"
     try:
@@ -891,6 +907,12 @@ def run_command(command: str, cwd: str = "", timeout: float = 0) -> str:
         workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else None
         if workdir is not None and not os.path.isdir(workdir):
             return f"错误：工作目录不存在：{workdir}"
+
+        # 后台化语法黑名单：从源头避免误用
+        bg_reason = _command_wants_background(cmd)
+        if bg_reason:
+            log_op({"tool": "run_command", "command": cmd, "ok": False, "error": "后台化语法"})
+            return f"错误：{bg_reason}"
 
         # 超时：取请求值，未指定用上限，且不得超过上限
         t = float(timeout) if timeout else EXEC_TIMEOUT_MAX
@@ -1145,6 +1167,723 @@ def redis_exec(command: str) -> str:
         return f"错误：{e}"
 
 
+# ---------------------------------------------------------------------------
+# GUI / 后台服务：解决 run_command 不适合长驻/无结束点进程的问题
+# ---------------------------------------------------------------------------
+def _validate_service_name(name):
+    """校验服务名，返回规范化结果；不合法抛 ValueError。"""
+    n = (name or "").strip()
+    if not _NAME_PATTERN.match(n):
+        raise ValueError(
+            f"服务名不合法：{name!r}（仅允许字母/数字/./_/-，最长 64 字符）"
+        )
+    return n
+
+
+def _service_dir(name):
+    return os.path.join(SERVICES_ROOT, name)
+
+
+def _pid_file(name):
+    return os.path.join(_service_dir(name), "pid")
+
+
+def _log_path(name, stream):
+    """stream: 'stdout' 或 'stderr'。"""
+    return os.path.join(_service_dir(name), "logs", f"{stream}.log")
+
+
+def _read_registry():
+    if not os.path.exists(SERVICES_REGISTRY):
+        return []
+    try:
+        with open(SERVICES_REGISTRY, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _write_registry(services):
+    """原子写入注册表（临时文件 + fsync + 替换），与文件工具同一安全策略。"""
+    ensure_dir(os.path.dirname(SERVICES_REGISTRY))
+    tmp = SERVICES_REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(services, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SERVICES_REGISTRY)
+
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _pid_alive(pid):
+    """跨平台检测进程是否存活。Windows 上 PID 被复用可能误判（短窗口），服务场景够用。"""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            # text=False：避开 subprocess 内部 reader 线程的 UTF-8 解码（tasklist 输出含非 UTF-8 字节时会崩）
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                capture_output=True, timeout=5,
+            ).stdout.decode("utf-8", errors="replace")
+            # tasklist 在找不到时输出 "INFO: No tasks are running..."；找到则包含 pid 字段
+            if "INFO:" in out:
+                return False
+            return f'"{pid}"' in out or f",{pid}," in out or f'"{pid}"' in out
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 进程存在但当前用户无权访问信号
+    except OSError:
+        return False
+
+
+def _kill_tree(pid, force=False, timeout=10.0):
+    """终止进程树（先温和，超时再强制）。返回是否成功结束。
+    Windows 注意：taskkill 无 /F 只发 WM_CLOSE，命令行/控制台进程大多忽略；
+    所以首次尝试给一个较短超时，触底即转 /F。"""
+    import time
+
+    if not _pid_alive(pid):
+        return True
+
+    # Windows 上温和路径几乎等于无效——只给 2s；Unix 上给完整 timeout 给进程清理机会
+    first_wait = 2.0 if (sys.platform == "win32" and not force) else timeout
+
+    if sys.platform == "win32":
+        flags = ["/PID", str(pid), "/T"]
+        if force:
+            flags.append("/F")
+        try:
+            subprocess.run(["taskkill", *flags], capture_output=True, timeout=first_wait)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    else:
+        import signal
+        try:
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+
+    deadline = time.time() + first_wait
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.2)
+
+    if not force:
+        return _kill_tree(pid, force=True, timeout=timeout)
+    return not _pid_alive(pid)
+
+
+def _parse_command(command):
+    """跨平台解析命令字符串为参数列表。
+    Windows 路径含反斜杠，直接 shlex(posix=True) 会把 \\ 当转义符；
+    先 double-up 反斜杠，shlex 当字面量处理后还原成原路径。
+    Windows 含空格路径用引号包裹即可。"""
+    if sys.platform == "win32":
+        normalized = command.replace("\\", "\\\\")
+        return shlex.split(normalized, posix=True)
+    return shlex.split(command, posix=True)
+
+
+# 命令首词黑名单：这些命令会启动后台进程/守护/终端复用器，不适合 run_command（带结束点的）
+_BACKGROUND_FIRST_WORDS = {
+    "start",      # Windows cmd 的 start：启动独立窗口
+    "nohup",      # Unix：脱离终端
+    "setsid",     # Unix：新建会话
+    "disown",     # Unix：把进程脱离作业
+    "screen",     # 终端复用器
+    "tmux",       # 终端复用器
+    "daemonize",  # 类 Unix 守护进程工具
+}
+
+
+def _command_wants_background(cmd):
+    """检测命令是否尝试以后台/守护方式运行。返回错误说明（不匹配返回 None）。"""
+    s = (cmd or "").lstrip()
+    if not s:
+        return None
+    # 首词匹配：只取第一段空白前的 token，去掉路径前缀
+    m = re.match(r"^([^\s|&;]+)", s)
+    if m:
+        first = os.path.basename(m.group(1)).lower()
+        # Windows 上 start 可能跟 /b /min 等参数，但首词仍是 start
+        if first in _BACKGROUND_FIRST_WORDS:
+            return (
+                f"命令首词 {first!r} 会启动后台进程/守护进程/终端复用器，"
+                f"不适合 run_command（有超时，会被中途杀掉）。"
+                f"请改用 launch_gui（GUI/一次性）或 service_start（后台服务）。"
+            )
+    # 末尾的裸 & （排除 &&）：命令以 & 结束会被放入后台
+    if re.search(r"(?<!--)&(?!!)\s*$", s):
+        return (
+            "命令以 & 结尾，会把进程放入后台。run_command 适合有结束点的命令，"
+            "请改用 launch_gui 或 service_start。"
+        )
+    return None
+
+
+def _spawn_detached(args, cwd=None, stdout_file=None, stderr_file=None):
+    """以"与父进程解耦"方式启动子进程，返回 Popen 对象。
+    Windows：DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+    Unix：start_new_session=True（脱离控制终端）
+    日志文件：直接传二进制 file 对象。subprocess 通过 fd 直传给子进程，不创建内部 pipe/reader 线程，
+    完全避开 TextIOWrapper 的 UTF-8 解码（子进程若输出含非法 UTF-8 字节不会崩）。"""
+    popen_kwargs = {
+        "args": args,
+        "shell": False,
+        "stdin": subprocess.DEVNULL,
+        # text=False 阻止 subprocess 把 stdout/stderr 包成 TextIOWrapper，避免 _communicate 里的
+        # reader 线程在子进程输出非 UTF-8 字节时抛 UnicodeDecodeError（Windows 上 Python 启动期会写
+        # 一些非 UTF-8 字节到控制台，CreateProcess 默认继承的句柄会捕获到）。
+        "text": False,
+    }
+    if cwd:
+        popen_kwargs["cwd"] = cwd
+    if stdout_file:
+        # 二进制追加 + 无缓冲：subprocess 用 fileno() 直传给子进程，无 pipe、无 reader 线程
+        popen_kwargs["stdout"] = open(stdout_file, "ab", buffering=0)
+    else:
+        popen_kwargs["stdout"] = subprocess.DEVNULL
+    if stderr_file:
+        popen_kwargs["stderr"] = open(stderr_file, "ab", buffering=0)
+    else:
+        popen_kwargs["stderr"] = subprocess.DEVNULL
+
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    return subprocess.Popen(**popen_kwargs)
+
+
+@mcp.tool()
+def launch_gui(
+    command: str,
+    working_dir: str = "",
+    wait: bool = False,
+    wait_timeout: float = 0,
+    name: str = "",
+) -> str:
+    """启动一个 GUI 应用或一次性可执行程序。火即忘（不阻塞当前 MCP 调用）。
+    command：要执行的命令字符串。按 shlex 拆分后传参——避免 shell 注入。
+      Windows 上若要启动 .exe，直接传 exe 路径；不要套用 cmd 的 start（start 走 shell 会被 run_command 拦截并提示用本工具）。
+    working_dir：工作目录（可选）。受 MCP_ALLOWED_ROOTS 约束。
+    wait：是否等待进程退出。默认 False（启动后立即返回 PID）。一次性安装包等需要等结束的传 True。
+    wait_timeout：wait=True 时的最大等待秒数（默认 30，不得超过 MCP_EXEC_TIMEOUT）。
+    name：可选。若传入则同时把进程纳入服务注册表（可被 service_status / service_logs / service_stop 管理），
+      日志写入 ~/.coding-mcp/services/<name>/logs/。同一名字只能跑一个实例，重复会被拒绝。
+      不传则纯火即忘——拿不回 PID 也没法清理。
+    ⚠️ 需开启 MCP_ENABLE_EXEC=1。
+    返回 JSON：{"pid":..., "command":..., "working_dir":..., "started_at":...,
+               "name"?:..., "log_files"?:{stdout,stderr}, "exit_code"?:..., "killed"?:...}"""
+    if not EXEC_ENABLED:
+        return "错误：命令执行未开启。请设置 MCP_ENABLE_EXEC=1。"
+    try:
+        if not command or not command.strip():
+            return "错误：命令不能为空"
+        parts = _parse_command(command)
+        if not parts:
+            return "错误：命令解析为空"
+
+        cwd = os.path.abspath(working_dir) if working_dir.strip() else None
+        if cwd is not None:
+            if not os.path.isdir(cwd):
+                return f"错误：工作目录不存在：{cwd}"
+            try:
+                ensure_allowed(cwd)
+            except ValueError as e:
+                return f"错误：{e}"
+
+        # 是否纳入服务注册
+        registered = bool(name and name.strip())
+        if registered:
+            try:
+                name = _validate_service_name(name)
+            except ValueError as e:
+                return f"错误：{e}"
+
+        # 日志路径：仅 registered 模式才落日志
+        logs_root = os.path.join(_service_dir(name), "logs") if registered else None
+        stdout_log = os.path.join(logs_root, "stdout.log") if logs_root else None
+        stderr_log = os.path.join(logs_root, "stderr.log") if logs_root else None
+        if logs_root:
+            ensure_dir(logs_root)
+
+        # 幂等检查（仅 registered 模式）：同名已在跑则拒
+        if registered:
+            pid_path = _pid_file(name)
+            if os.path.exists(pid_path):
+                try:
+                    with open(pid_path, "r", encoding="utf-8") as f:
+                        old_pid = int(f.read().strip() or "0")
+                    if _pid_alive(old_pid):
+                        log_op({"tool": "launch_gui", "name": name, "ok": False, "error": "已在运行"})
+                        return f"错误：服务 {name!r} 已在运行（pid={old_pid}）。如需重启请先 service_stop。"
+                    try:
+                        os.remove(pid_path)
+                    except OSError:
+                        pass
+                except (ValueError, OSError):
+                    pass
+
+        log_op(
+            {
+                "tool": "launch_gui",
+                "command": command,
+                "cwd": cwd,
+                "wait": wait,
+                "name": name if registered else None,
+                "ok": None,
+            }
+        )
+
+        proc = _spawn_detached(parts, cwd=cwd, stdout_file=stdout_log, stderr_file=stderr_log)
+
+        result = {
+            "pid": proc.pid,
+            "command": command,
+            "working_dir": cwd,
+            "started_at": _now_iso(),
+        }
+
+        # registered 模式：写 pid_file + 注册表 + 短轮询存活
+        if registered:
+            ensure_dir(_service_dir(name))
+            pid_path = _pid_file(name)
+            try:
+                with open(pid_path, "w", encoding="utf-8") as f:
+                    f.write(str(proc.pid))
+            except OSError as e:
+                return f"错误：写入 pid_file 失败：{e}"
+
+            services = [s for s in _read_registry() if s.get("name") != name]
+            entry = {
+                "name": name,
+                "pid": proc.pid,
+                "command": command,
+                "working_dir": cwd,
+                "log_dir": logs_root,
+                "stdout_log": stdout_log,
+                "stderr_log": stderr_log,
+                "started_at": result["started_at"],
+            }
+            services.append(entry)
+            _write_registry(services)
+            result["name"] = name
+            result["log_files"] = {"stdout": stdout_log, "stderr": stderr_log}
+
+            import time
+            time.sleep(1.0)
+            if not _pid_alive(proc.pid):
+                # 启动后立刻退出：清理注册
+                services = [s for s in _read_registry() if s.get("name") != name]
+                _write_registry(services)
+                try:
+                    os.remove(pid_path)
+                except OSError:
+                    pass
+                log_op({"tool": "launch_gui", "name": name, "ok": False, "error": "启动后立即退出"})
+                return (
+                    f"错误：进程 {name!r} 启动后立即退出（pid={proc.pid}）。"
+                    f"请检查命令或查看日志：{stderr_log}"
+                )
+
+        if not wait:
+            log_op({"tool": "launch_gui", "pid": proc.pid, "name": name if registered else None, "ok": True})
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        # wait=True：等到结束或超时
+        # 用 poll() 轮询而不是 proc.wait()：wait() 内部走 _communicate，会启动 reader 线程去读
+        # stdout/stderr 的 TextIOWrapper，遇到非 UTF-8 字节会抛 UnicodeDecodeError。
+        # 我们已经把 stdout/stderr 重定向到文件，不需要再读一次；只关心退出码即可。
+        t = float(wait_timeout) if wait_timeout else EXEC_TIMEOUT_MAX
+        t = min(max(t, 0.1), EXEC_TIMEOUT_MAX)
+        import time
+        deadline = time.time() + t
+        exit_code = None
+        while time.time() < deadline:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                break
+            time.sleep(0.1)
+        if exit_code is not None:
+            result["exit_code"] = exit_code
+            log_op({"tool": "launch_gui", "pid": proc.pid, "exit_code": exit_code, "ok": True})
+        else:
+            _kill_tree(proc.pid, force=True, timeout=5.0)
+            result["killed"] = True
+            result["error"] = f"超时（>{t} 秒），已强制终止"
+            log_op({"tool": "launch_gui", "pid": proc.pid, "ok": False, "error": "超时"})
+
+        # wait 模式下若已注册：进程已结束，从注册表移除（wait 用法通常是"装个东西等它跑完"）
+        if registered and result.get("exit_code") is not None:
+            services = [s for s in _read_registry() if s.get("name") != name]
+            if len(services) != len(_read_registry()):
+                _write_registry(services)
+            try:
+                pid_path = _pid_file(name)
+                if os.path.exists(pid_path):
+                    os.remove(pid_path)
+            except OSError:
+                pass
+
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "launch_gui", "command": command, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def service_start(
+    name: str,
+    command: str,
+    working_dir: str = "",
+    log_dir: str = "",
+) -> str:
+    """启动一个后台守护进程并托管其生命周期。
+    name：服务标识（字母/数字/./_/-，最长 64 字符）。同一名字只能跑一个实例；重名且仍在运行会被拒绝。
+    command：要执行的命令字符串。按 shlex 拆分后传参。
+    working_dir：工作目录（可选，受 MCP_ALLOWED_ROOTS 约束）。
+    log_dir：日志目录（可选，默认 ~/.coding-mcp/services/<name>/logs/，受 MCP_ALLOWED_ROOTS 约束）。
+    ⚠️ 需开启 MCP_ENABLE_EXEC=1。stdout/stderr 持续追加到日志文件，不会丢也不会撑爆上下文。
+    返回 JSON：{"name":..., "pid":..., "command":..., "working_dir":..., "log_files":{stdout,stderr}, "started_at":...}"""
+    if not EXEC_ENABLED:
+        return "错误：命令执行未开启。请设置 MCP_ENABLE_EXEC=1。"
+    try:
+        try:
+            name = _validate_service_name(name)
+        except ValueError as e:
+            return f"错误：{e}"
+        if not command or not command.strip():
+            return "错误：命令不能为空"
+        parts = _parse_command(command)
+        if not parts:
+            return "错误：命令解析为空"
+
+        cwd = os.path.abspath(working_dir) if working_dir.strip() else None
+        if cwd is not None:
+            if not os.path.isdir(cwd):
+                return f"错误：工作目录不存在：{cwd}"
+            try:
+                ensure_allowed(cwd)
+            except ValueError as e:
+                return f"错误：{e}"
+
+        if log_dir.strip():
+            logs_root = os.path.abspath(log_dir)
+            try:
+                ensure_allowed(logs_root)
+            except ValueError as e:
+                return f"错误：{e}"
+        else:
+            logs_root = os.path.join(_service_dir(name), "logs")
+
+        # 幂等：同 name 已在运行则拒绝
+        pid_path = _pid_file(name)
+        if os.path.exists(pid_path):
+            try:
+                with open(pid_path, "r", encoding="utf-8") as f:
+                    old_pid = int(f.read().strip() or "0")
+                if _pid_alive(old_pid):
+                    log_op({"tool": "service_start", "name": name, "ok": False, "error": "已在运行"})
+                    return f"错误：服务 {name!r} 已在运行（pid={old_pid}）。如需重启请先 service_stop。"
+                # pid 已死但 pid_file 残留——清理后继续启动
+                try:
+                    os.remove(pid_path)
+                except OSError:
+                    pass
+            except (ValueError, OSError):
+                pass  # pid_file 损坏，忽略
+
+        # 注册表去重（防御性：pid_file 丢了但注册表里还在）
+        services = _read_registry()
+        services = [s for s in services if s.get("name") != name]
+
+        # 准备日志目录与文件（必须先建好再 spawn，否则启动初期日志会丢）
+        ensure_dir(logs_root)
+        stdout_path = os.path.join(logs_root, "stdout.log")
+        stderr_path = os.path.join(logs_root, "stderr.log")
+
+        log_op({"tool": "service_start", "name": name, "command": command, "cwd": cwd, "ok": None})
+        proc = _spawn_detached(parts, cwd=cwd, stdout_file=stdout_path, stderr_file=stderr_path)
+
+        # 写 pid_file + 更新注册表（原子）
+        ensure_dir(_service_dir(name))
+        try:
+            with open(pid_path, "w", encoding="utf-8") as f:
+                f.write(str(proc.pid))
+        except OSError as e:
+            return f"错误：写入 pid_file 失败：{e}"
+
+        entry = {
+            "name": name,
+            "pid": proc.pid,
+            "command": command,
+            "working_dir": cwd,
+            "log_dir": logs_root,
+            "stdout_log": stdout_path,
+            "stderr_log": stderr_path,
+            "started_at": _now_iso(),
+        }
+        services.append(entry)
+        _write_registry(services)
+
+        # 短轮询：1 秒内死了就报错（避免启动后立刻退出的命令被误认为"运行中"）
+        import time
+        time.sleep(1.0)
+        if not _pid_alive(proc.pid):
+            # 从注册表移除
+            services = [s for s in _read_registry() if s.get("name") != name]
+            _write_registry(services)
+            try:
+                os.remove(pid_path)
+            except OSError:
+                pass
+            log_op({"tool": "service_start", "name": name, "ok": False, "error": "启动后立即退出"})
+            return f"错误：服务 {name!r} 启动后立即退出（pid={proc.pid}）。请检查命令或查看日志：{stderr_path}"
+
+        log_op({"tool": "service_start", "name": name, "pid": proc.pid, "ok": True})
+        return json.dumps(entry, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "service_start", "name": name, "command": command, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def service_stop(
+    name: str,
+    force: bool = False,
+    timeout: float = 10.0,
+) -> str:
+    """停止一个由 service_start 启动的后台服务。
+    name：服务标识。
+    force：是否强制终止（默认 False：先温和发信号，10 秒不退再强杀）。
+    timeout：等待退出的秒数（默认 10）。
+    返回 JSON：{"name":..., "pid":..., "stopped":bool, "took_ms":..., "forced":bool}"""
+    if not EXEC_ENABLED:
+        return "错误：命令执行未开启。请设置 MCP_ENABLE_EXEC=1。"
+    try:
+        try:
+            name = _validate_service_name(name)
+        except ValueError as e:
+            return f"错误：{e}"
+
+        services = _read_registry()
+        entry = next((s for s in services if s.get("name") == name), None)
+        if entry is None:
+            return f"错误：未找到服务 {name!r}（未通过 service_start 注册）"
+        pid = int(entry.get("pid", 0))
+        pid_path = _pid_file(name)
+
+        import time
+        start = time.time()
+        # 即使 force=True 也先温和一次，给应用清理机会
+        stopped = _kill_tree(pid, force=force, timeout=timeout)
+        took_ms = int((time.time() - start) * 1000)
+
+        if stopped:
+            try:
+                if os.path.exists(pid_path):
+                    os.remove(pid_path)
+            except OSError:
+                pass
+            services = [s for s in _read_registry() if s.get("name") != name]
+            _write_registry(services)
+            log_op({"tool": "service_stop", "name": name, "pid": pid, "ok": True})
+        else:
+            log_op({"tool": "service_stop", "name": name, "pid": pid, "ok": False, "error": "终止失败"})
+
+        return json.dumps(
+            {"name": name, "pid": pid, "stopped": stopped, "took_ms": took_ms, "forced": force},
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "service_stop", "name": name, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def service_status(name: str = "") -> str:
+    """列出所有托管服务或查询单个服务的存活状态。
+    name：可选。传单个名字查询该服务；不传则列出全部。
+    返回 JSON：{"services":[{name, pid, alive, started_at, command, working_dir, log_dir}, ...]}"""
+    try:
+        if name.strip():
+            try:
+                name = _validate_service_name(name)
+            except ValueError as e:
+                return f"错误：{e}"
+            services = [s for s in _read_registry() if s.get("name") == name]
+            if not services:
+                return f"错误：未找到服务 {name!r}"
+        else:
+            services = _read_registry()
+
+        out = []
+        for s in services:
+            pid = int(s.get("pid", 0))
+            out.append(
+                {
+                    "name": s.get("name"),
+                    "pid": pid,
+                    "alive": _pid_alive(pid),
+                    "started_at": s.get("started_at"),
+                    "command": s.get("command"),
+                    "working_dir": s.get("working_dir"),
+                    "log_dir": s.get("log_dir"),
+                }
+            )
+        log_op({"tool": "service_status", "name": name or "(all)", "count": len(out), "ok": True})
+        return json.dumps({"services": out}, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "service_status", "name": name, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def service_logs(
+    name: str,
+    stream: str = "both",
+    tail_lines: int = 100,
+) -> str:
+    """读取后台服务的日志末尾片段。
+    name：服务标识。
+    stream："stdout"、"stderr" 或 "both"（默认 both）。
+    tail_lines：返回最后 N 行（默认 100，最大 1000）。
+    ⚠️ 不支持 follow（持续推送）。MCP 是请求/响应协议，实时 tail 请用 shell 自己 less/tail。
+    返回：{"name":..., "stream":..., "lines":N, "stdout":..., "stderr":..., "tail_lines":N}"""
+    try:
+        try:
+            name = _validate_service_name(name)
+        except ValueError as e:
+            return f"错误：{e}"
+
+        services = _read_registry()
+        entry = next((s for s in services if s.get("name") == name), None)
+        if entry is None:
+            return f"错误：未找到服务 {name!r}"
+
+        tail_lines = max(1, min(int(tail_lines or 100), 1000))
+        out = {
+            "name": name,
+            "stream": stream,
+            "tail_lines": tail_lines,
+            "stdout": None,
+            "stderr": None,
+        }
+
+        def _tail(path):
+            if not path or not os.path.exists(path):
+                return "(日志文件不存在)"
+            try:
+                # 用 deque 高效取尾
+                from collections import deque
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    return "\n".join(deque(f, maxlen=tail_lines))
+            except Exception as e:  # noqa: BLE001
+                return f"(读取失败：{e})"
+
+        if stream in ("stdout", "both"):
+            out["stdout"] = _tail(entry.get("stdout_log"))
+        if stream in ("stderr", "both"):
+            out["stderr"] = _tail(entry.get("stderr_log"))
+
+        log_op({"tool": "service_logs", "name": name, "stream": stream, "ok": True})
+        return json.dumps(out, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "service_logs", "name": name, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def service_clean(remove_logs: bool = False, dry_run: bool = False) -> str:
+    """扫描服务注册表，清理已死进程对应的条目（孤儿清理）。
+    remove_logs：是否同时删除该服务的日志目录（默认 False，保留日志用于事后排错）。
+    dry_run：仅扫描不删除（默认 False）。
+    典型场景：服务器重启后注册表里残留着上轮进程的条目；或服务进程被外部 kill 后 pid_file 与注册表不一致。
+    返回 JSON：{"scanned":N, "removed":[{name, pid, had_pid_file, logs_removed}], "alive":M, "dry_run":bool}"""
+    try:
+        services = _read_registry()
+        alive_names = []
+        removed_list = []
+        for s in services:
+            name = s.get("name")
+            pid = int(s.get("pid", 0))
+            pid_path = _pid_file(name)
+            had_pid_file = os.path.exists(pid_path)
+            if _pid_alive(pid):
+                alive_names.append(name)
+                continue
+            # 已死
+            logs_removed = False
+            item = {"name": name, "pid": pid, "had_pid_file": had_pid_file, "logs_removed": False}
+            if not dry_run:
+                # 默认仅清理 pid_file；只有明确要求才删日志目录（事后排错有用）
+                try:
+                    if os.path.exists(pid_path):
+                        os.remove(pid_path)
+                except OSError:
+                    pass
+                if remove_logs:
+                    svc_dir = _service_dir(name)
+                    try:
+                        shutil.rmtree(svc_dir)
+                        logs_removed = True
+                    except OSError:
+                        pass
+                item["logs_removed"] = logs_removed
+            removed_list.append(item)
+
+        if not dry_run:
+            # 重写注册表（移除已死条目）
+            new_registry = [s for s in services if s.get("name") in alive_names]
+            if len(new_registry) != len(services):
+                _write_registry(new_registry)
+
+        log_op(
+            {
+                "tool": "service_clean",
+                "scanned": len(services),
+                "removed": len(removed_list),
+                "alive": len(alive_names),
+                "dry_run": dry_run,
+                "ok": True,
+            }
+        )
+        return json.dumps(
+            {
+                "scanned": len(services),
+                "removed": removed_list,
+                "alive": len(alive_names),
+                "dry_run": dry_run,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "service_clean", "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
 if __name__ == "__main__":
     db_status = "/".join(
         k for k in ("mysql", "pgsql", "redis")
@@ -1154,6 +1893,7 @@ if __name__ == "__main__":
         f"[coding-mcp] 已启动 v{VERSION}"
         f"（备份：{'关' if DISABLE_BACKUP else '开'}，审计：{AUDIT_LOG or '关'}，"
         f"执行：{'开' if EXEC_ENABLED else '关'}，数据库：{db_status}，"
-        f"写库：{'开' if DB_ALLOW_WRITE else '关'}）\n"
+        f"写库：{'开' if DB_ALLOW_WRITE else '关'}，"
+        f"服务目录：{SERVICES_ROOT}）\n"
     )
     mcp.run(transport="stdio")

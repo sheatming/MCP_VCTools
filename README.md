@@ -50,6 +50,15 @@
 | `get_project_info`| 识别语言、包管理器、测试框架、目录结构             |
 | `load_dev_context`| 加载项目预制开发上下文（技术文档/规范/进度等）       |
 
+### 数据库
+
+| 工具               | 作用                                 |
+| ---------------- | ---------------------------------- |
+| `db_query`       | 在 MySQL / PostgreSQL 上执行 SQL（默认只读）    |
+| `db_tables`      | 列出数据库中的所有表                        |
+| `db_schema`      | 查看表结构（字段名/类型/是否可空/默认值）           |
+| `redis_exec`     | 执行 Redis 命令（默认只读）                  |
+
 ## 环境要求
 
 - Python 3.10+（本项目在 Python 3.13 上验证，无需 Node.js）
@@ -80,6 +89,22 @@ python -m venv .venv
 | `MCP_ENABLE_EXEC=1`           | 开启 `run_command` 命令执行（**默认关闭**，需显式开启）              |
 | `MCP_EXEC_TIMEOUT=30`         | 命令执行超时上限（秒，默认 30）                              |
 | `MCP_GIT_BIN=/path/to/git`    | 指定 git 可执行文件路径（默认从 PATH 查找 `git`）            |
+| `MCP_MYSQL_URL=mysql://user:pass@host:3306/db` | MySQL 连接（未设置则 `db_*` 的 mysql 不可用）       |
+| `MCP_PGSQL_URL=postgresql://user:pass@host:5432/db` | PostgreSQL 连接（未设置则 `db_*` 的 pgsql 不可用） |
+| `MCP_REDIS_URL=redis://:pass@host:6379/0` | Redis 连接（未设置则 `redis_exec` 不可用）          |
+| `MCP_DB_ALLOW_WRITE=1`        | 允许数据库写操作（**默认只读**，需显式开启）                       |
+
+## 数据库支持
+
+连接信息通过环境变量 `MCP_MYSQL_URL` / `MCP_PGSQL_URL` / `MCP_REDIS_URL` 提供（URL 格式，密码可用 URL 编码如 `%40` 表示 `@`）。
+
+- `db_query`：执行 SQL。**默认只读**——`SELECT/SHOW/DESC/DESCRIBE/EXPLAIN` 放行，`INSERT/UPDATE/DELETE/DDL` 等写操作需设置 `MCP_DB_ALLOW_WRITE=1`。
+- `db_tables`：列出所有表。
+- `db_schema`：查看表结构（表名做白名单校验，防 SQL 注入）。
+- `redis_exec`：执行 Redis 命令（如 `GET foo`、`KEYS *`、`HGETALL h`）。**默认只读**，写命令（`SET/DEL/...`）需设置 `MCP_DB_ALLOW_WRITE=1`。
+- 所有数据库操作都写入审计日志；结果超长自动截断（8000 字符）。
+
+> ⚠️ 数据库默认只读是最安全的形态。开启 `MCP_DB_ALLOW_WRITE=1` 后 AI 可执行任意写 SQL/Redis 写命令，请仅在可信环境使用。
 
 ## 命令执行（run_command）
 

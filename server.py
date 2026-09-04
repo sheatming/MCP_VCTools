@@ -16,6 +16,12 @@
   MCP_AUDIT_LOG=/abs/file.log   自定义审计日志路径（默认 ~/.coding-mcp/audit.log）
   MCP_ENABLE_EXEC=1             开启命令执行工具（默认关闭，需显式开启）
   MCP_EXEC_TIMEOUT=30           命令执行超时上限（秒，默认 30）
+
+数据库（可选，URL 格式，未设置则对应工具不可用）：
+  MCP_MYSQL_URL=mysql://user:pass@host:3306/dbname
+  MCP_PGSQL_URL=postgresql://user:pass@host:5432/dbname
+  MCP_REDIS_URL=redis://:pass@host:6379/0
+  MCP_DB_ALLOW_WRITE=1          允许数据库写操作（默认只读，需显式开启）
 """
 
 import os
@@ -67,6 +73,14 @@ except ValueError:
 
 # git 可执行文件路径（可选覆盖，默认从 PATH 查找）
 GIT_BIN = os.environ.get("MCP_GIT_BIN", "git").strip() or "git"
+
+# 数据库连接（可选，URL 格式，未设置则对应工具不可用）
+MYSQL_URL = os.environ.get("MCP_MYSQL_URL", "").strip()
+PGSQL_URL = os.environ.get("MCP_PGSQL_URL", "").strip()
+REDIS_URL = os.environ.get("MCP_REDIS_URL", "").strip()
+
+# 数据库写操作开关：默认只读，需设置 MCP_DB_ALLOW_WRITE=1 才允许写
+DB_ALLOW_WRITE = os.environ.get("MCP_DB_ALLOW_WRITE", "") in ("1", "true", "True")
 
 # ---------------------------------------------------------------------------
 # 工具函数
@@ -330,6 +344,72 @@ def _backup_note(backup_path):
     if DISABLE_BACKUP:
         return "备份：已关闭（MCP_DISABLE_BACKUP）"
     return "备份：新文件，无需备份"
+
+
+# ---------------------------------------------------------------------------
+# 数据库辅助函数
+# ---------------------------------------------------------------------------
+import re
+import shlex
+from urllib.parse import urlparse, unquote
+
+# SQL 只读关键字白名单：首关键字命中则视为只读，其余视为写操作
+_SQL_READONLY_KW = {"SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN", "PRAGMA"}
+
+# Redis 只读命令白名单：默认只读模式下仅允许这些命令
+_REDIS_READONLY_CMDS = {
+    "GET", "MGET", "KEYS", "SCAN", "EXISTS", "TYPE", "TTL", "PTTL", "STRLEN",
+    "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSCAN",
+    "LRANGE", "LLEN", "LINDEX", "LPOS",
+    "SMEMBERS", "SCARD", "SISMEMBER", "SSCAN", "SRANDMEMBER",
+    "ZRANGE", "ZRANGEBYSCORE", "ZREVRANGE", "ZREVRANGEBYSCORE", "ZSCORE",
+    "ZCARD", "ZCOUNT", "ZRANK", "ZREVRANK", "ZSCAN", "ZLEXCOUNT",
+    "DBSIZE", "INFO", "PING", "ECHO", "RANDOMKEY",
+    "BITCOUNT", "BITPOS", "GETRANGE", "PFCOUNT", "XLEN", "XRANGE", "XREVRANGE",
+    "GEOPOS", "GEODIST", "GEOHASH", "GEOSEARCH",
+}
+
+_DB_CONFIGS = {
+    "mysql": {"url": MYSQL_URL, "scheme": "mysql", "default_port": 3306},
+    "pgsql": {"url": PGSQL_URL, "scheme": "postgresql", "default_port": 5432},
+}
+
+
+def _parse_db_url(url):
+    """解析数据库 URL，返回 (host, port, user, password, dbname)。"""
+    p = urlparse(url)
+    host = p.hostname or "127.0.0.1"
+    port = p.port or 0
+    user = unquote(p.username) if p.username else ""
+    password = unquote(p.password) if p.password else ""
+    db = (p.path or "/").lstrip("/")
+    return host, port, user, password, db
+
+
+def _sql_is_readonly(sql):
+    m = re.match(r"^\s*([A-Za-z]+)", sql)
+    if not m:
+        return False
+    return m.group(1).upper() in _SQL_READONLY_KW
+
+
+def _fmt_table(cols, rows, limit=8000):
+    """把列名 + 行数据格式化为对齐文本表格。"""
+    cols = [str(c) for c in cols]
+    rows = [[str(c) if c is not None else "NULL" for c in r] for r in rows]
+    widths = [len(c) for c in cols]
+    for r in rows:
+        for i, v in enumerate(r):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(v))
+    lines = [" | ".join(c.ljust(widths[i]) for i, c in enumerate(cols))]
+    lines.append("-+-".join("-" * w for w in widths))
+    for r in rows:
+        lines.append(" | ".join(v.ljust(widths[i]) for i, v in enumerate(r) if i < len(widths)))
+    out = "\n".join(lines)
+    if len(out) > limit:
+        out = out[:limit] + f"\n...（输出截断，共 {len(rows)} 行）"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -867,10 +947,213 @@ def run_command(command: str, cwd: str = "", timeout: float = 0) -> str:
         return f"错误：{e}"
 
 
+def _fmt_redis_result(result, limit=8000):
+    """格式化 Redis 返回值（str/list/dict/None/int）。"""
+    if result is None:
+        return "(nil)"
+    if isinstance(result, (list, tuple)):
+        if not result:
+            return "(empty list)"
+        out = "\n".join(str(x) for x in result)
+    elif isinstance(result, dict):
+        if not result:
+            return "(empty hash)"
+        out = "\n".join(f"{k}: {v}" for k, v in result.items())
+    else:
+        out = str(result)
+    if len(out) > limit:
+        out = out[:limit] + f"\n…（输出过长，已截断，共 {len(out)} 字符）"
+    return out
+
+
+@mcp.tool()
+def db_query(kind: str, sql: str, limit: int = 100) -> str:
+    """在 MySQL / PostgreSQL 上执行 SQL 并返回结果。
+    kind：数据库类型，"mysql" 或 "pgsql"（连接信息由 MCP_MYSQL_URL / MCP_PGSQL_URL 环境变量提供）。
+    sql：要执行的 SQL 语句。默认只读，INSERT/UPDATE/DELETE/DDL 需设置 MCP_DB_ALLOW_WRITE=1。
+    limit：SELECT 返回行数上限（可选，默认 100）。"""
+    try:
+        kind = (kind or "").strip().lower()
+        cfg = _DB_CONFIGS.get(kind)
+        if not cfg:
+            return f"错误：不支持的数据库类型 {kind}（仅支持 mysql / pgsql）"
+        if not cfg["url"]:
+            return f"错误：未配置 {kind} 连接（请设置 MCP_{kind.upper()}_URL）"
+        sql = (sql or "").strip()
+        if not sql:
+            return "错误：SQL 不能为空"
+
+        if not _sql_is_readonly(sql) and not DB_ALLOW_WRITE:
+            log_op({"tool": "db_query", "kind": kind, "sql": sql, "ok": False, "error": "写操作被拒（只读模式）"})
+            return "错误：该 SQL 是写操作，已被只读模式拦截。如需执行请设置 MCP_DB_ALLOW_WRITE=1。"
+
+        host, port, user, password, db = _parse_db_url(cfg["url"])
+        port = port or cfg["default_port"]
+
+        log_op({"tool": "db_query", "kind": kind, "sql": sql, "ok": None})
+
+        if kind == "mysql":
+            import pymysql
+            conn = pymysql.connect(
+                host=host, port=port, user=user, password=password,
+                database=db or None, charset="utf8mb4", connect_timeout=5,
+            )
+        else:
+            import psycopg2
+            conn = psycopg2.connect(
+                host=host, port=port, user=user, password=password,
+                dbname=db or "postgres", connect_timeout=5,
+            )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                if cur.description:  # 有结果集（SELECT/SHOW/EXPLAIN 等）
+                    cols = [d[0] for d in cur.description]
+                    rows = cur.fetchmany(max(1, int(limit)))
+                    log_op({"tool": "db_query", "kind": kind, "ok": True, "rows": len(rows)})
+                    return f"{_fmt_table(cols, rows)}\n（返回 {len(rows)} 行，limit={limit}）"
+                else:  # 写操作 / 无结果集
+                    conn.commit()
+                    n = cur.rowcount
+                    log_op({"tool": "db_query", "kind": kind, "ok": True, "affected": n})
+                    return f"执行成功，影响 {n} 行"
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "db_query", "kind": kind, "sql": sql, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def db_tables(kind: str) -> str:
+    """列出数据库中的所有表。kind：数据库类型，"mysql" 或 "pgsql"。"""
+    try:
+        kind = (kind or "").strip().lower()
+        cfg = _DB_CONFIGS.get(kind)
+        if not cfg:
+            return f"错误：不支持的数据库类型 {kind}（仅支持 mysql / pgsql）"
+        if not cfg["url"]:
+            return f"错误：未配置 {kind} 连接（请设置 MCP_{kind.upper()}_URL）"
+        host, port, user, password, db = _parse_db_url(cfg["url"])
+        port = port or cfg["default_port"]
+        log_op({"tool": "db_tables", "kind": kind, "ok": None})
+        if kind == "mysql":
+            import pymysql
+            conn = pymysql.connect(
+                host=host, port=port, user=user, password=password,
+                database=db or None, charset="utf8mb4", connect_timeout=5,
+            )
+            sql = "SHOW TABLES"
+        else:
+            import psycopg2
+            conn = psycopg2.connect(
+                host=host, port=port, user=user, password=password,
+                dbname=db or "postgres", connect_timeout=5,
+            )
+            sql = "SELECT tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY tablename"
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                tables = [r[0] for r in cur.fetchall()]
+            log_op({"tool": "db_tables", "kind": kind, "ok": True, "count": len(tables)})
+            return "\n".join(tables) if tables else "（无表）"
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "db_tables", "kind": kind, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def db_schema(kind: str, table: str) -> str:
+    """查看表结构（字段名 / 类型 / 是否可空 / 默认值等）。kind：数据库类型，"mysql" 或 "pgsql"。table：表名。"""
+    try:
+        kind = (kind or "").strip().lower()
+        cfg = _DB_CONFIGS.get(kind)
+        if not cfg:
+            return f"错误：不支持的数据库类型 {kind}（仅支持 mysql / pgsql）"
+        if not cfg["url"]:
+            return f"错误：未配置 {kind} 连接（请设置 MCP_{kind.upper()}_URL）"
+        table = (table or "").strip()
+        if not re.match(r"^[A-Za-z0-9_]+$", table):
+            return f"错误：非法表名 {table}（仅允许字母/数字/下划线）"
+        host, port, user, password, db = _parse_db_url(cfg["url"])
+        port = port or cfg["default_port"]
+        log_op({"tool": "db_schema", "kind": kind, "table": table, "ok": None})
+        if kind == "mysql":
+            import pymysql
+            conn = pymysql.connect(
+                host=host, port=port, user=user, password=password,
+                database=db or None, charset="utf8mb4", connect_timeout=5,
+            )
+            cols = ["Field", "Type", "Null", "Key", "Default", "Extra"]
+            with conn.cursor() as cur:
+                cur.execute(f"DESCRIBE `{table}`")
+                rows = cur.fetchall()
+            conn.close()
+            log_op({"tool": "db_schema", "kind": kind, "table": table, "ok": True})
+            return _fmt_table(cols, rows)
+        else:
+            import psycopg2
+            conn = psycopg2.connect(
+                host=host, port=port, user=user, password=password,
+                dbname=db or "postgres", connect_timeout=5,
+            )
+            cols = ["column_name", "data_type", "is_nullable", "column_default"]
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name, data_type, is_nullable, column_default "
+                    "FROM information_schema.columns WHERE table_name=%s ORDER BY ordinal_position",
+                    (table,),
+                )
+                rows = cur.fetchall()
+            conn.close()
+            log_op({"tool": "db_schema", "kind": kind, "table": table, "ok": True})
+            return _fmt_table(cols, rows)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "db_schema", "kind": kind, "table": table, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def redis_exec(command: str) -> str:
+    """执行 Redis 命令并返回结果。
+    command：完整命令字符串，如 "GET foo"、"KEYS *"、"HGETALL myhash"。
+    连接信息由 MCP_REDIS_URL 环境变量提供。默认只读，写命令（SET/DEL 等）需设置 MCP_DB_ALLOW_WRITE=1。"""
+    try:
+        if not REDIS_URL:
+            return "错误：未配置 Redis 连接（请设置 MCP_REDIS_URL）"
+        command = (command or "").strip()
+        if not command:
+            return "错误：命令不能为空"
+        parts = shlex.split(command, posix=False)
+        if not parts:
+            return "错误：命令不能为空"
+        cmd = parts[0].upper()
+        if cmd not in _REDIS_READONLY_CMDS and not DB_ALLOW_WRITE:
+            log_op({"tool": "redis_exec", "command": command, "ok": False, "error": "写命令被拒（只读模式）"})
+            return f"错误：命令 {cmd} 是写操作，已被只读模式拦截。如需执行请设置 MCP_DB_ALLOW_WRITE=1。"
+
+        import redis as redis_lib
+        r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5)
+        log_op({"tool": "redis_exec", "command": command, "ok": None})
+        result = r.execute_command(*parts)
+        log_op({"tool": "redis_exec", "command": command, "ok": True})
+        return _fmt_redis_result(result)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "redis_exec", "command": command, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
 if __name__ == "__main__":
+    db_status = "/".join(
+        k for k in ("mysql", "pgsql", "redis")
+        if (MYSQL_URL if k == "mysql" else PGSQL_URL if k == "pgsql" else REDIS_URL)
+    ) or "无"
     sys.stderr.write(
         f"[coding-mcp] 已启动 v{VERSION}"
         f"（备份：{'关' if DISABLE_BACKUP else '开'}，审计：{AUDIT_LOG or '关'}，"
-        f"执行：{'开' if EXEC_ENABLED else '关'}）\n"
+        f"执行：{'开' if EXEC_ENABLED else '关'}，数据库：{db_status}，"
+        f"写库：{'开' if DB_ALLOW_WRITE else '关'}）\n"
     )
     mcp.run(transport="stdio")

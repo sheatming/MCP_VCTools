@@ -38,9 +38,9 @@
 
 | 工具               | 作用                                 |
 | ---------------- | ---------------------------------- |
-| `install_deps`   | 自动探测包管理器并安装依赖（npm/yarn/pnpm/pip/poetry/uv/cargo） |
-| `run_tests`      | 自动探测测试框架并运行（pytest/jest/vitest/go/cargo） |
-| `run_lint`       | 自动探测并运行 lint/格式化（ruff/eslint/prettier）  |
+| `install_deps`   | 自动探测包管理器并安装依赖（npm/yarn/pnpm/pip/poetry/uv/cargo/**go**） |
+| `run_tests`      | 自动探测测试框架并运行（pytest/jest/vitest/**go test**/cargo） |
+| `run_lint`       | 自动探测并运行 lint/格式化（ruff/eslint/prettier/**go vet**）  |
 | `run_command`    | 执行命令行（需显式开启，带超时与退出码）            |
 
 ### 项目感知与开发上下文

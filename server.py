@@ -633,7 +633,7 @@ def git_commit(message: str, cwd: str = "") -> str:
 
 @mcp.tool()
 def install_deps(cwd: str = "") -> str:
-    """自动探测包管理器并安装依赖（pnpm/yarn/npm/poetry/uv/pip/cargo）。cwd：项目目录（可选）。"""
+    """自动探测包管理器并安装依赖（pnpm/yarn/npm/poetry/uv/pip/cargo/go）。cwd：项目目录（可选）。"""
     try:
         workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
         if not os.path.isdir(workdir):
@@ -650,6 +650,7 @@ def install_deps(cwd: str = "") -> str:
             "uv": ["uv", "sync"],
             "pip": ["pip", "install", "-r", "requirements.txt"],
             "cargo": ["cargo", "build"],
+            "go": ["go", "mod", "download"],
         }
         cmd = cmds.get(pm)
         if not cmd:
@@ -695,7 +696,7 @@ def run_tests(cwd: str = "") -> str:
 
 @mcp.tool()
 def run_lint(cwd: str = "") -> str:
-    """自动探测并运行代码检查/格式化（ruff/black/eslint/prettier）。cwd：项目目录（可选）。"""
+    """自动探测并运行代码检查/格式化（ruff/black/eslint/prettier/go vet）。cwd：项目目录（可选）。"""
     try:
         workdir = os.path.abspath(str(cwd)) if str(cwd).strip() else os.getcwd()
         if not os.path.isdir(workdir):
@@ -710,12 +711,14 @@ def run_lint(cwd: str = "") -> str:
             candidates.append(["npx", "eslint", "."])
         if ".prettierrc" in names or "prettier.config.js" in names:
             candidates.append(["npx", "prettier", "--check", "."])
+        if "go.mod" in names:
+            candidates.append(["go", "vet", "./..."])
         if not candidates:
             # 兜底：Python 用 py_compile，JS 无则提示
             if "package.json" in names:
                 candidates.append(["npx", "prettier", "--check", "."])
             else:
-                return "错误：未识别到 lint/格式化工具（ruff/eslint/prettier）"
+                return "错误：未识别到 lint/格式化工具（ruff/eslint/prettier/go vet）"
         cmd = candidates[0]
         log_op({"tool": "run_lint", "cmd": cmd, "cwd": workdir, "ok": None})
         code, out, err = run_cmd(cmd, cwd=workdir, timeout=120.0)

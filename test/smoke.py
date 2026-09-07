@@ -1212,6 +1212,191 @@ def _handle_direct_tcpip(chan, dest_addr, dest_port):
             pass
 
 
+async def test_api_upload_file():
+    """文件上传（multipart/form-data）：本地起 HTTP server 接收并解析，验证
+      - 单文件上传（path）+ 附加表单字段
+      - 直接给 content（不落盘）+ 覆盖 filename / MIME
+      - 多文件同名字段
+      - 上传后可接 api_assert 断言
+      - 错误处理：文件不存在 / files 与 body 互斥 / 路径越权
+    用本地 server 而不是 httpbin —— 外网不稳时不至于让测试挂掉。"""
+    import email as _email
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received = []
+
+    class UploadHandler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            ctype = self.headers.get("Content-Type", "")
+            entry = {"path": self.path, "content_type": ctype, "parts": []}
+            if ctype.startswith("multipart/form-data"):
+                msg = _email.message_from_bytes(
+                    b"Content-Type: " + ctype.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw
+                )
+                for part in msg.get_payload():
+                    if not isinstance(part, _email.message.Message):
+                        continue
+                    payload = part.get_payload(decode=True) or b""
+                    entry["parts"].append({
+                        "name": part.get_param("name", header="content-disposition"),
+                        "filename": part.get_filename(),
+                        "content": payload.decode("utf-8", "replace"),
+                        "content_type": part.get_content_type(),
+                    })
+            received.append(entry)
+            body = b'{"ok":true,"saved":1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), UploadHandler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-test-upload-")
+    proj = tempfile.mkdtemp(prefix="coding-mcp-test-upload-proj-")
+    audit = os.path.join(fake_home, "audit.log")
+
+    f1 = os.path.join(proj, "hello.txt")
+    f2 = os.path.join(proj, "data.json")
+    Path(f1).write_text("hello-upload", encoding="utf-8")
+    Path(f2).write_text('{"k":1}', encoding="utf-8")
+
+    here = Path(__file__).resolve().parent.parent
+    python = str(here / ".venv" / "Scripts" / "python.exe")
+    server_py = str(here / "server.py")
+
+    params = StdioServerParameters(
+        command=python,
+        args=[server_py],
+        env={
+            **os.environ,
+            "HOME": fake_home, "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit, "MCP_ENABLE_EXEC": "1",
+            "MCP_ALLOWED_ROOTS": proj,
+        },
+    )
+    try:
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                base = f"http://127.0.0.1:{port}"
+
+                # ---- 1. 单文件 + 附加字段 ----
+                received.clear()
+                r = await session.call_tool("api_request", {
+                    "url": f"{base}/upload",
+                    "method": "POST",
+                    "files": _json.dumps([{"field": "file", "path": f1}]),
+                    "fields": _json.dumps({"user_id": "123", "tag": "avatar"}),
+                    "save_as": "upload-1",
+                })
+                data = _json.loads(_text(r))
+                print("\n[upload-1] status =", data["status_code"],
+                      "uploaded =", data.get("uploaded"))
+                assert data["status_code"] == 200
+                assert data["uploaded"][0]["filename"] == "hello.txt"
+                assert data["uploaded"][0]["size"] == len("hello-upload")
+
+                parts = received[0]["parts"]
+                file_parts = [p for p in parts if p["filename"]]
+                text_parts = [p for p in parts if not p["filename"]]
+                assert len(file_parts) == 1, f"应有 1 个文件 part：{parts}"
+                assert file_parts[0]["name"] == "file"
+                assert file_parts[0]["filename"] == "hello.txt"
+                assert file_parts[0]["content"] == "hello-upload"
+                fields_got = {p["name"]: p["content"] for p in text_parts}
+                assert fields_got.get("user_id") == "123", f"附加字段未收到：{fields_got}"
+                assert fields_got.get("tag") == "avatar"
+                assert "boundary=" in received[0]["content_type"], "multipart 缺 boundary"
+
+                # ---- 1b. 上传后可断言（注意：api_assert 只认最近一次响应，
+                #          所以必须紧跟在 upload-1 后面，不能等到 upload-3 之后）----
+                r = await session.call_tool("api_assert", {
+                    "checks": _json.dumps([
+                        {"type": "status_eq", "value": 200},
+                        {"type": "jsonpath_eq", "path": "$.saved", "value": 1},
+                    ]),
+                    "response_ref": "upload-1",
+                })
+                res = _json.loads(_text(r))
+                print("[upload-assert]", res["summary"])
+                assert res["pass"] is True, f"上传后断言应通过：{res}"
+
+                # ---- 2. 直接给 content（不落盘）+ 覆盖 filename / MIME ----
+                received.clear()
+                r = await session.call_tool("api_request", {
+                    "url": f"{base}/upload",
+                    "method": "POST",
+                    "files": _json.dumps([{
+                        "field": "doc", "content": "inline-content",
+                        "filename": "renamed.md", "content_type": "text/markdown",
+                    }]),
+                })
+                data = _json.loads(_text(r))
+                print("[upload-2] uploaded =", data.get("uploaded"))
+                fp = [p for p in received[0]["parts"] if p["filename"]][0]
+                assert fp["filename"] == "renamed.md", "filename 应被覆盖"
+                assert fp["content"] == "inline-content"
+                assert fp["content_type"] == "text/markdown", "MIME 应被覆盖"
+
+                # ---- 3. 多文件同名字段 ----
+                received.clear()
+                r = await session.call_tool("api_request", {
+                    "url": f"{base}/upload",
+                    "method": "POST",
+                    "files": _json.dumps([
+                        {"field": "files", "path": f1},
+                        {"field": "files", "path": f2},
+                    ]),
+                })
+                data = _json.loads(_text(r))
+                print("[upload-3] 上传文件数 =", len(data.get("uploaded", [])))
+                fps = [p for p in received[0]["parts"] if p["filename"]]
+                assert len(fps) == 2, f"应有 2 个文件 part：{fps}"
+                assert {p["filename"] for p in fps} == {"hello.txt", "data.json"}
+                assert all(p["name"] == "files" for p in fps)
+
+                # ---- 5. 错误：文件不存在 ----
+                r = await session.call_tool("api_request", {
+                    "url": f"{base}/upload", "method": "POST",
+                    "files": _json.dumps([{"path": os.path.join(proj, "nope.txt")}]),
+                })
+                assert "不存在" in _text(r), f"文件不存在应报错：{_text(r)}"
+                print("[err-missing]", _text(r)[:70])
+
+                # ---- 6. 错误：files 与 body 互斥 ----
+                r = await session.call_tool("api_request", {
+                    "url": f"{base}/upload", "method": "POST",
+                    "files": _json.dumps([{"path": f1}]),
+                    "body": '{"a":1}',
+                })
+                assert "互斥" in _text(r), f"files+body 应报互斥：{_text(r)}"
+                print("[err-exclusive]", _text(r)[:70])
+
+                # ---- 7. 错误：路径越权（MCP_ALLOWED_ROOTS 之外）----
+                outside = os.path.join(fake_home, "outside.txt")
+                Path(outside).write_text("x", encoding="utf-8")
+                r = await session.call_tool("api_request", {
+                    "url": f"{base}/upload", "method": "POST",
+                    "files": _json.dumps([{"path": outside}]),
+                })
+                assert "不允许" in _text(r), f"越权路径应报错：{_text(r)}"
+                print("[err-denied]", _text(r)[:70])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        shutil.rmtree(fake_home, ignore_errors=True)
+        shutil.rmtree(proj, ignore_errors=True)
+
+
 async def test_ssh_exec_via_local_sshd():
     """SSH 集成测试：自起一个 test sshd，用 ssh_exec 跑命令。"""
     import json as _json
@@ -1475,5 +1660,6 @@ if __name__ == "__main__":
     asyncio.run(test_hide_window_defaults())
     asyncio.run(test_api_request_and_assert())
     asyncio.run(test_api_save_response())
+    asyncio.run(test_api_upload_file())
     asyncio.run(test_ssh_exec_via_local_sshd())
     asyncio.run(test_ssh_tunnel_local_forward())

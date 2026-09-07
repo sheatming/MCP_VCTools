@@ -63,7 +63,7 @@
 
 | 工具                  | 作用                                       |
 | ------------------- | ---------------------------------------- |
-| `api_request`       | 发 HTTP/HTTPS 请求（GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS），支持 basic / bearer auth、自动 JSON、超时与重定向控制 |
+| `api_request`       | 发 HTTP/HTTPS 请求（GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS），支持 basic / bearer auth、自动 JSON、**文件上传（multipart）**、超时与重定向控制 |
 | `api_assert`        | 对最近一次响应的断言（status_eq / status_in / header_eq / jsonpath_eq / jsonpath_contains / body_contains / elapsed_lt） |
 | `api_save_response` | 把响应的 body / headers / full 写到本地文件（受 `MCP_ALLOWED_ROOTS` 约束） |
 
@@ -330,6 +330,53 @@ api_request(
 ```
 
 返回 JSON：含 `status_code` / `headers` / `body` / `body_size` / `elapsed_ms` / `json`（自动解析） / `ref`。
+
+### `api_request` — 文件上传（multipart/form-data）
+
+用 `files` 参数上传。传了 `files` 会走 multipart，`body` 必须留空（二者互斥）。
+
+```python
+# 单文件 + 附加表单字段
+api_request(
+    url="https://api.example.com/upload",
+    method="POST",
+    files='[{"field":"file", "path":"./avatar.png"}]',
+    fields='{"user_id":"123", "tag":"avatar"}',      # 非文件的普通表单字段
+    auth_type="bearer", auth_token="xxx",
+    save_as="upload-1",
+)
+api_assert(checks='[{"type":"jsonpath_eq","path":"$.url","value":"..."}]',
+           response_ref="upload-1")
+```
+
+`files` 是 JSON 数组，每项支持：
+
+| 字段 | 说明 |
+| --- | --- |
+| `field` | 表单字段名，默认 `file` |
+| `path` | 本地文件路径（**受 `MCP_ALLOWED_ROOTS` 约束**）。与 `content` 二选一 |
+| `content` | 直接给文本内容，不落盘（方便测小文件）。与 `path` 二选一 |
+| `filename` | 可选，覆盖上传时的文件名（默认取 `path` 的文件名） |
+| `content_type` | 可选，MIME 类型（默认按扩展名猜，猜不出用 `application/octet-stream`） |
+
+```python
+# 直接给内容，并覆盖文件名与 MIME
+files='[{"field":"doc","content":"# hi","filename":"README.md","content_type":"text/markdown"}]'
+
+# 多文件（同名字段出现多次）
+files='[{"field":"files","path":"./a.txt"},{"field":"files","path":"./b.jpg"}]'
+```
+
+要点：
+
+- **不要手动设 `Content-Type`** —— multipart 必须带 `boundary`，由工具自动生成；
+  你手写的 `multipart/form-data` 缺 boundary 会让服务端解析失败，所以该 header 会被主动移除
+- 单文件上限 **100 MB**（防止误传巨型文件撑爆内存）
+- `fields` 仅在传了 `files` 时生效
+- 返回结构会多一个 `uploaded` 数组，回显本次实际上传的 `field` / `filename` / `size` / `content_type`，
+  便于确认字段名和 MIME 有没有写对
+- 上传后可直接 `api_assert`。**注意 `api_assert` 只认最近一次响应**，
+  所以断言要紧跟上传，别中间又发别的请求
 
 ### `api_assert` — 多类型断言
 

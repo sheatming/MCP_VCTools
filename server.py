@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover
 
 from mcp.server.mcpserver import MCPServer
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -2150,12 +2150,96 @@ def _resolve_jsonpath(data, path):
     return cur
 
 
+# 单文件上传大小上限（防止误传巨型文件把进程内存撑爆）
+_API_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+
+def _prepare_multipart(files_spec: str, fields_spec: str):
+    """把文件上传描述解析成 httpx 可直接用的 (files, data)。
+
+    files_spec：JSON 数组（或单个对象），每项形如
+      {"field":"file", "path":"C:/tmp/a.txt"}                        # 从本地文件读
+      {"field":"doc",  "path":"b.pdf", "filename":"r.pdf",
+       "content_type":"application/pdf"}                             # 覆盖文件名/MIME
+      {"field":"note", "content":"hello", "filename":"n.txt"}        # 直接给内容，不落盘
+      - field：表单字段名，默认 "file"
+      - path / content：二选一（path 受 MCP_ALLOWED_ROOTS 约束）
+      - filename：可选，默认取 path 的文件名
+      - content_type：可选，默认按扩展名猜，猜不出用 application/octet-stream
+      同名 field 可出现多次（多文件上传）。
+    fields_spec：JSON 对象，附加的普通表单字段，如 {"user_id":"123"}
+
+    返回 (files_list, data_dict)；出错抛 ValueError。
+    """
+    import mimetypes
+
+    files_list = []
+    if files_spec and files_spec.strip():
+        try:
+            spec = json.loads(files_spec)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"files 不是合法 JSON：{e}")
+        if isinstance(spec, dict):
+            spec = [spec]
+        if not isinstance(spec, list):
+            raise ValueError("files 必须是 JSON 数组（或单个对象）")
+
+        for i, item in enumerate(spec):
+            if not isinstance(item, dict):
+                raise ValueError(f"files[{i}] 必须是对象")
+            field = str(item.get("field") or "file")
+            path = (item.get("path") or "").strip()
+            content = item.get("content")
+
+            if path:
+                abs_path = os.path.abspath(path)
+                try:
+                    ensure_allowed(abs_path)
+                except ValueError as e:
+                    raise ValueError(f"files[{i}] 路径不允许：{e}")
+                if not os.path.isfile(abs_path):
+                    raise ValueError(f"files[{i}] 文件不存在：{abs_path}")
+                size = os.path.getsize(abs_path)
+                if size > _API_MAX_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"files[{i}] 文件过大：{size} 字节，超过上限 "
+                        f"{_API_MAX_UPLOAD_BYTES}（100MB）"
+                    )
+                with open(abs_path, "rb") as f:
+                    data = f.read()
+                filename = str(item.get("filename") or os.path.basename(abs_path))
+            elif content is not None:
+                data = str(content).encode("utf-8")
+                filename = str(item.get("filename") or f"{field}.txt")
+            else:
+                raise ValueError(f"files[{i}] 必须提供 path 或 content 之一")
+
+            ctype = str(item.get("content_type") or "").strip()
+            if not ctype:
+                ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            files_list.append((field, (filename, data, ctype)))
+
+    data_dict: dict = {}
+    if fields_spec and fields_spec.strip():
+        try:
+            parsed = json.loads(fields_spec)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"fields 不是合法 JSON：{e}")
+        if not isinstance(parsed, dict):
+            raise ValueError("fields 必须是 JSON 对象")
+        data_dict = {str(k): str(v) for k, v in parsed.items()}
+
+    return files_list, data_dict
+
+
 @mcp.tool()
 def api_request(
     url: str,
     method: str = "GET",
     headers: str = "",
     body: str = "",
+    files: str = "",
+    fields: str = "",
     auth_type: str = "",
     auth_token: str = "",
     timeout: float = 30.0,
@@ -2163,18 +2247,31 @@ def api_request(
     verify_ssl: bool = True,
     save_as: str = "",
 ) -> str:
-    """发起一个 HTTP/HTTPS 请求并返回完整响应。
+    """发起一个 HTTP/HTTPS 请求并返回完整响应（支持 JSON / 表单 / 文件上传）。
     url：完整 URL（http/https）
     method：GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS（默认 GET）
     headers：JSON 字符串，如 {"Content-Type":"application/json","X-Token":"abc"}
     body：请求体字符串。Content-Type 未指定时自动判断：能 JSON 解析则当 application/json
+      ⚠️ 与 files 互斥——传了 files 就不要传 body（multipart 的 body 由本工具构造）。
+    files：文件上传（multipart/form-data）。JSON 数组，每项形如：
+      {"field":"file", "path":"C:/tmp/a.txt"}                     # 从本地文件读
+      {"field":"doc",  "path":"b.pdf", "filename":"r.pdf",
+       "content_type":"application/pdf"}                          # 覆盖文件名与 MIME
+      {"field":"note", "content":"hello", "filename":"n.txt"}     # 直接给内容，不落盘
+      - path 受 MCP_ALLOWED_ROOTS 约束；单文件上限 100MB
+      - 同名 field 可重复出现（多文件上传）
+      - 用 files 时不要手动设 Content-Type，本工具会自动生成带 boundary 的
+    fields：附加的普通表单字段，JSON 对象，如 {"user_id":"123","tag":"avatar"}
+      仅在传了 files 时生效（作为 multipart 的非文件字段）。
     auth_type：'' / 'basic' / 'bearer'
     auth_token：basic 时 'user:pass'，bearer 时为 token 串
     timeout：秒（默认 30）
     follow_redirects：是否跟随 3xx（默认 True）
     verify_ssl：是否校验证书（默认 True）
     save_as：可选，把响应注册为此 ref 名（便于 api_assert 引用）。空则用 'api-<timestamp>'
-    返回 JSON：{ref, status_code, headers, body, body_size, elapsed_ms, json, redirected}
+    返回 JSON：{ref, status_code, headers, body, body_size, elapsed_ms, json, redirected,
+               uploaded?（本次上传的文件清单）}
+    典型用法：上传后接 api_assert 断言返回的 url / file_id。
     """
     if httpx is None:
         return "错误：httpx 未安装。请运行：pip install httpx"
@@ -2210,6 +2307,24 @@ def api_request(
                 pass
         body_bytes = body.encode("utf-8")
 
+    # ---- 文件上传（multipart/form-data）----
+    files_list = []
+    fields_dict: dict = {}
+    if (files and files.strip()) or (fields and fields.strip()):
+        if body.strip():
+            return "错误：files 与 body 互斥。上传文件请留空 body，普通表单字段用 fields 传。"
+        try:
+            files_list, fields_dict = _prepare_multipart(files, fields)
+        except ValueError as e:
+            return f"错误：{e}"
+        if not files_list:
+            return "错误：files 解析后为空，请至少提供一个文件（path 或 content）"
+        # multipart 的 Content-Type 必须带 boundary，由 httpx 自动生成。
+        # 用户手写的 "multipart/form-data" 缺 boundary 会让服务端解析失败，故移除。
+        for k in list(hdr_dict):
+            if k.lower() == "content-type":
+                hdr_dict.pop(k)
+
     auth = None
     if auth_type == "basic":
         if ":" not in (auth_token or ""):
@@ -2223,7 +2338,10 @@ def api_request(
     elif auth_type:
         return f"错误：不支持的 auth_type: {auth_type!r}（仅 basic/bearer 或空）"
 
-    log_op({"tool": "api_request", "url": url, "method": method, "auth_type": auth_type, "ok": None})
+    log_op({
+        "tool": "api_request", "url": url, "method": method,
+        "auth_type": auth_type, "upload_files": len(files_list), "ok": None,
+    })
     t0 = time.time()
     try:
         with httpx.Client(
@@ -2232,7 +2350,13 @@ def api_request(
             verify=verify_ssl,
             auth=auth,
         ) as client:
-            resp = client.request(method, url, headers=hdr_dict, content=body_bytes)
+            if files_list:
+                req_kw = {"headers": hdr_dict, "files": files_list}
+                if fields_dict:
+                    req_kw["data"] = fields_dict
+                resp = client.request(method, url, **req_kw)
+            else:
+                resp = client.request(method, url, headers=hdr_dict, content=body_bytes)
         elapsed_ms = (time.time() - t0) * 1000
         body_text = resp.text
         body_json = None
@@ -2255,6 +2379,12 @@ def api_request(
             "json": body_json,
             "redirected": len(resp.history) > 0,
         }
+        if files_list:
+            # 回显本次实际上传了什么，便于确认 field / filename / MIME 是否正确
+            result["uploaded"] = [
+                {"field": f, "filename": fn, "size": len(blob), "content_type": ct}
+                for f, (fn, blob, ct) in files_list
+            ]
         _LAST_API_RESPONSE["ref"] = ref
         _LAST_API_RESPONSE["ts"] = time.time()
         _LAST_API_RESPONSE["data"] = result

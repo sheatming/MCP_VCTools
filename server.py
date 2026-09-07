@@ -39,10 +39,28 @@ import datetime
 import subprocess
 import difflib
 import re
+import threading
+import time
+import socket
+import select
+import base64
+import hashlib
+import ipaddress
+import socketserver
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None  # api_* 工具在缺包时显式报错
+
+try:
+    import paramiko
+except ImportError:  # pragma: no cover
+    paramiko = None  # ssh_* 工具在缺包时显式报错
 
 from mcp.server.mcpserver import MCPServer
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -1882,6 +1900,734 @@ def service_clean(remove_logs: bool = False, dry_run: bool = False) -> str:
     except Exception as e:  # noqa: BLE001
         log_op({"tool": "service_clean", "ok": False, "error": str(e)})
         return f"错误：{e}"
+
+
+# =============================================================================
+# API 测试工具（httpx）：api_request / api_assert / api_save_response
+# =============================================================================
+# 最后一次 api_request 的响应快照，供 api_assert 引用
+_LAST_API_RESPONSE: dict = {"ref": None, "ts": 0.0, "data": None}
+
+
+def _resolve_jsonpath(data, path):
+    """简易 JSONPath：支持 $.a.b[0].c / $.a[2] / $.a[0].b。够覆盖 90% 用例。"""
+    if not path or path == "$":
+        return data
+    if not isinstance(path, str) or not path.startswith("$"):
+        return None
+    rest = path[1:]
+    if rest.startswith("."):
+        rest = rest[1:]
+    # 同时按 '.' 和 '[N]' 切分（注意 [(\d+)] 是 capture group，split 会插入 None）
+    parts = re.split(r"\.|\[(\d+)\]", rest)
+    parts = [p for p in parts if p not in ("", None)]
+    cur = data
+    for p in parts:
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(p)]
+            except (ValueError, IndexError):
+                return None
+        elif isinstance(cur, dict):
+            if p not in cur:
+                return None
+            cur = cur[p]
+        else:
+            return None
+    return cur
+
+
+@mcp.tool()
+def api_request(
+    url: str,
+    method: str = "GET",
+    headers: str = "",
+    body: str = "",
+    auth_type: str = "",
+    auth_token: str = "",
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    verify_ssl: bool = True,
+    save_as: str = "",
+) -> str:
+    """发起一个 HTTP/HTTPS 请求并返回完整响应。
+    url：完整 URL（http/https）
+    method：GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS（默认 GET）
+    headers：JSON 字符串，如 {"Content-Type":"application/json","X-Token":"abc"}
+    body：请求体字符串。Content-Type 未指定时自动判断：能 JSON 解析则当 application/json
+    auth_type：'' / 'basic' / 'bearer'
+    auth_token：basic 时 'user:pass'，bearer 时为 token 串
+    timeout：秒（默认 30）
+    follow_redirects：是否跟随 3xx（默认 True）
+    verify_ssl：是否校验证书（默认 True）
+    save_as：可选，把响应注册为此 ref 名（便于 api_assert 引用）。空则用 'api-<timestamp>'
+    返回 JSON：{ref, status_code, headers, body, body_size, elapsed_ms, json, redirected}
+    """
+    if httpx is None:
+        return "错误：httpx 未安装。请运行：pip install httpx"
+    if not url or not url.strip():
+        return "错误：url 不能为空"
+    method = (method or "GET").upper().strip()
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+        return f"错误：不支持的 method: {method!r}"
+
+    hdr_dict: dict = {}
+    if headers.strip():
+        try:
+            parsed = json.loads(headers)
+            if not isinstance(parsed, dict):
+                return "错误：headers 必须是 JSON 对象"
+            hdr_dict = {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError as e:
+            return f"错误：headers 不是合法 JSON：{e}"
+
+    body_bytes = b""
+    if body:
+        # Content-Type 大小写不敏感
+        ct = ""
+        for k, v in hdr_dict.items():
+            if k.lower() == "content-type":
+                ct = v
+                break
+        if not ct:
+            try:
+                json.loads(body)
+                hdr_dict["Content-Type"] = "application/json"
+            except json.JSONDecodeError:
+                pass
+        body_bytes = body.encode("utf-8")
+
+    auth = None
+    if auth_type == "basic":
+        if ":" not in (auth_token or ""):
+            return "错误：basic auth_token 必须是 'user:pass' 格式"
+        u, p = auth_token.split(":", 1)
+        auth = httpx.BasicAuth(u, p)
+    elif auth_type == "bearer":
+        if not auth_token:
+            return "错误：bearer auth_token 不能为空"
+        hdr_dict["Authorization"] = f"Bearer {auth_token}"
+    elif auth_type:
+        return f"错误：不支持的 auth_type: {auth_type!r}（仅 basic/bearer 或空）"
+
+    log_op({"tool": "api_request", "url": url, "method": method, "auth_type": auth_type, "ok": None})
+    t0 = time.time()
+    try:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            verify=verify_ssl,
+            auth=auth,
+        ) as client:
+            resp = client.request(method, url, headers=hdr_dict, content=body_bytes)
+        elapsed_ms = (time.time() - t0) * 1000
+        body_text = resp.text
+        body_json = None
+        try:
+            body_json = resp.json()
+        except Exception:
+            pass
+
+        ref = save_as.strip() or f"api-{int(time.time() * 1000)}"
+        result = {
+            "ref": ref,
+            "url": str(resp.url),
+            "method": method,
+            "status_code": resp.status_code,
+            "reason": resp.reason_phrase,
+            "headers": dict(resp.headers),
+            "body": body_text,
+            "body_size": len(resp.content),
+            "elapsed_ms": round(elapsed_ms, 2),
+            "json": body_json,
+            "redirected": len(resp.history) > 0,
+        }
+        _LAST_API_RESPONSE["ref"] = ref
+        _LAST_API_RESPONSE["ts"] = time.time()
+        _LAST_API_RESPONSE["data"] = result
+        log_op({"tool": "api_request", "url": url, "method": method, "status": resp.status_code, "ok": True})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except httpx.TimeoutException:
+        log_op({"tool": "api_request", "url": url, "ok": False, "error": "timeout"})
+        return f"错误：请求超时（>{timeout} 秒）"
+    except httpx.HTTPError as e:
+        log_op({"tool": "api_request", "url": url, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def api_assert(
+    checks: str,
+    response_ref: str = "",
+) -> str:
+    """对最近一次 api_request 的响应做断言（不重发请求）。
+    checks：JSON 数组，每条断言形如 {"type":..., ...}。支持的 type：
+      - status_eq          {type, value:200}
+      - status_in          {type, value:[200,201,204]}
+      - header_eq          {type, key:"Content-Type", value:"application/json", contains:false}
+      - jsonpath_eq        {type, path:"$.user.id", value:42, contains:false}
+      - jsonpath_contains  {type, path:"$.name", value:"foo"}
+      - body_contains      {type, value:"OK"}
+      - elapsed_lt         {type, value:2000}     # 毫秒
+    response_ref：可选，对应 api_request 的 save_as 名（不传则用最近一次）
+    返回 JSON：{pass, results, summary}
+    """
+    if httpx is None:
+        return "错误：httpx 未安装"
+    try:
+        check_list = json.loads(checks)
+        if not isinstance(check_list, list):
+            return "错误：checks 必须是 JSON 数组"
+    except json.JSONDecodeError as e:
+        return f"错误：checks 不是合法 JSON：{e}"
+
+    resp = _LAST_API_RESPONSE.get("data")
+    if not resp:
+        return "错误：没有可断言的响应。请先调用 api_request。"
+    if response_ref and resp.get("ref") != response_ref:
+        return f"错误：response_ref={response_ref!r} 与最近一次 api_request 不匹配（当前 ref: {resp.get('ref')!r}）。\n暂仅保留最近一次响应，需要多 ref 引用请用 save_as 串行执行。"
+
+    results = []
+    all_pass = True
+    for ck in check_list:
+        if not isinstance(ck, dict):
+            results.append({"check": ck, "pass": False, "reason": "断言项必须是对象"})
+            all_pass = False
+            continue
+        t = ck.get("type", "")
+        v = ck.get("value")
+        path = ck.get("path", "")
+        key = ck.get("key", "")
+        contains = bool(ck.get("contains", False))
+        rec: dict = {"check": ck, "pass": False, "actual": None, "reason": ""}
+        try:
+            if t == "status_eq":
+                actual = resp.get("status_code")
+                rec["actual"] = actual
+                rec["pass"] = (actual == v)
+            elif t == "status_in":
+                actual = resp.get("status_code")
+                rec["actual"] = actual
+                rec["pass"] = (actual in (v or []))
+            elif t == "header_eq":
+                hdrs = {k.lower(): vv for k, vv in (resp.get("headers") or {}).items()}
+                actual = hdrs.get(key.lower())
+                rec["actual"] = actual
+                if contains:
+                    rec["pass"] = bool(actual) and (str(v) in str(actual))
+                else:
+                    rec["pass"] = (actual == v)
+            elif t == "jsonpath_eq":
+                actual = _resolve_jsonpath(resp.get("json"), path)
+                rec["actual"] = actual
+                if contains:
+                    rec["pass"] = bool(actual) and (str(v) in str(actual))
+                else:
+                    rec["pass"] = (actual == v)
+            elif t == "jsonpath_contains":
+                actual = _resolve_jsonpath(resp.get("json"), path)
+                rec["actual"] = actual
+                if isinstance(actual, (list, str)):
+                    rec["pass"] = (v in actual)
+                else:
+                    rec["pass"] = False
+            elif t == "body_contains":
+                actual = resp.get("body", "")
+                rec["actual"] = f"<{len(actual)} chars>"
+                rec["pass"] = (v in actual)
+            elif t == "elapsed_lt":
+                actual = resp.get("elapsed_ms")
+                rec["actual"] = actual
+                rec["pass"] = (actual is not None and actual < v)
+            else:
+                rec["reason"] = f"未知断言类型: {t!r}"
+        except Exception as e:  # noqa: BLE001
+            rec["reason"] = str(e)
+        if not rec["pass"]:
+            all_pass = False
+        results.append(rec)
+
+    out = {
+        "pass": all_pass,
+        "ref": resp.get("ref"),
+        "results": results,
+        "summary": f"{sum(1 for r in results if r['pass'])}/{len(results)} passed",
+    }
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def api_save_response(
+    path: str,
+    response_ref: str = "",
+    part: str = "body",
+    overwrite: bool = True,
+) -> str:
+    """把 api_request 的响应某部分保存到文件。
+    path：本地文件路径（写入受 MCP_ALLOWED_ROOTS 约束）
+    response_ref：可选，对应 api_request 的 save_as 名（不传则用最近一次）
+    part：'body' / 'headers' / 'full'（含 status + headers + body 的 JSON）
+    overwrite：是否覆盖已有文件（默认 True；False 时文件已存在则报错）
+    """
+    if not path.strip():
+        return "错误：path 不能为空"
+    resp = _LAST_API_RESPONSE.get("data")
+    if not resp:
+        return "错误：没有可保存的响应。请先调用 api_request。"
+    if response_ref and resp.get("ref") != response_ref:
+        return f"错误：response_ref={response_ref!r} 与最近一次不匹配"
+    if part == "body":
+        content = resp.get("body", "")
+    elif part == "headers":
+        content = json.dumps(resp.get("headers", {}), ensure_ascii=False, indent=2)
+    elif part == "full":
+        content = json.dumps(resp, ensure_ascii=False, indent=2)
+    else:
+        return f"错误：不支持的 part: {part!r}（body/headers/full）"
+    abs_path = os.path.abspath(path)
+    try:
+        ensure_allowed(os.path.dirname(abs_path) or abs_path)
+    except ValueError as e:
+        return f"错误：{e}"
+    if not overwrite and os.path.exists(abs_path):
+        return f"错误：文件已存在，未覆盖：{abs_path}"
+    with open(abs_path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    log_op({"tool": "api_save_response", "path": abs_path, "part": part, "ok": True})
+    return f"已保存 {part} 到 {abs_path}（{len(content)} 字符）"
+
+
+# =============================================================================
+# SSH 工具（paramiko）：ssh_exec / ssh_upload / ssh_download / ssh_tunnel / ssh_disconnect
+# =============================================================================
+# 命名会话池：name -> {"client":..., "server"?:..., "thread"?:..., "host":..., "port":..., "user":..., "ts":...}
+_SSH_POOL: dict = {}
+_SSH_POOL_LOCK = threading.Lock()
+
+
+def _load_pkey(key_path: str, passphrase: str):
+    """尝试 RSA / Ed25519 / ECDSA / DSS 加载私钥"""
+    pw = passphrase or None
+    last_err: Exception | None = None
+    for loader in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.DSSKey):
+        try:
+            return loader.from_private_key_file(key_path, password=pw)
+        except paramiko.ssh_exception.PasswordRequiredException:
+            return None
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"无法加载私钥 {key_path}：{last_err}")
+
+
+def _open_ssh_client(
+    host: str, port: int, user: str,
+    password: str, key_path: str, key_passphrase: str,
+    timeout: float, strict_host_key: bool,
+):
+    """开一个临时 SSH 连接（不缓存）"""
+    if paramiko is None:
+        raise RuntimeError("paramiko 未安装。请运行：pip install paramiko")
+    client = paramiko.SSHClient()
+    if strict_host_key:
+        try:
+            client.load_system_host_keys()
+        except Exception:
+            pass
+    else:
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pkey = _load_pkey(key_path, key_passphrase) if key_path else None
+    client.connect(
+        hostname=host, port=int(port or 22), username=user,
+        password=password or None, pkey=pkey, timeout=timeout,
+        look_for_keys=False, allow_agent=False, banner_timeout=timeout,
+        auth_timeout=timeout,
+    )
+    return client
+
+
+def _get_ssh_session(
+    host: str, port: int, user: str,
+    password: str, key_path: str, key_passphrase: str,
+    name: str, timeout: float, strict_host_key: bool,
+):
+    """name 给定：池里有就复用（健康检查），没有就建一个并缓存。
+    name 为空：每次新建（调用方负责 close）。
+    返回 (client, reused)。"""
+    if not name:
+        return _open_ssh_client(host, port, user, password, key_path, key_passphrase, timeout, strict_host_key), False
+
+    with _SSH_POOL_LOCK:
+        sess = _SSH_POOL.get(name)
+    if sess:
+        try:
+            transport = sess["client"].get_transport()
+            if transport is not None and transport.is_active():
+                return sess["client"], True
+        except Exception:
+            pass
+        # 死连接：清理
+        with _SSH_POOL_LOCK:
+            try:
+                sess["client"].close()
+            except Exception:
+                pass
+            _SSH_POOL.pop(name, None)
+
+    client = _open_ssh_client(host, port, user, password, key_path, key_passphrase, timeout, strict_host_key)
+    with _SSH_POOL_LOCK:
+        _SSH_POOL[name] = {
+            "client": client, "host": host, "port": int(port or 22), "user": user, "ts": time.time(),
+        }
+    return client, False
+
+
+def _close_ssh_session(name: str) -> str:
+    """内部：关闭命名会话（含 tunnel 停服）"""
+    with _SSH_POOL_LOCK:
+        sess = _SSH_POOL.pop(name, None)
+    if not sess:
+        return f"错误：连接池中没有 {name!r}"
+    if sess.get("server") is not None:
+        try:
+            sess["server"].shutdown()
+            sess["server"].server_close()
+        except Exception:
+            pass
+    try:
+        sess["client"].close()
+    except Exception:
+        pass
+    return f"已停止 {name}"
+
+
+def _sftp_mkdir_p(sftp, remote_dir: str) -> None:
+    """递归创建远程目录（不抛已存在错）"""
+    if not remote_dir or remote_dir in ("/", "."):
+        return
+    try:
+        sftp.stat(remote_dir)
+        return
+    except IOError:
+        pass
+    parent = os.path.dirname(remote_dir.rstrip("/")).rstrip("/")
+    if parent and parent != remote_dir:
+        _sftp_mkdir_p(sftp, parent)
+    try:
+        sftp.mkdir(remote_dir)
+    except IOError:
+        pass
+
+
+@mcp.tool()
+def ssh_exec(
+    host: str, port: int = 22, user: str = "",
+    password: str = "", key_path: str = "", key_passphrase: str = "",
+    command: str = "", timeout: float = 30,
+    name: str = "", strict_host_key: bool = False,
+) -> str:
+    """在远程主机上执行一条命令。
+    host：主机名或 IP
+    port：SSH 端口（默认 22）
+    user：SSH 用户名
+    password / key_path：二选一，key_path 优先
+    key_passphrase：私钥口令（可选）
+    command：要执行的命令
+    timeout：秒
+    name：可选，注册到会话池。后续同名调用可复用。fire-and-forget 不传
+    strict_host_key：是否严格校验 known_hosts（默认 False，跳过）
+    返回 JSON：{host, user, command, exit_code, stdout, stderr, elapsed_ms, reused}
+    """
+    if paramiko is None:
+        return "错误：paramiko 未安装。请运行：pip install paramiko"
+    if not host or not user or not command:
+        return "错误：host / user / command 必填"
+    log_op({"tool": "ssh_exec", "host": host, "user": user, "name": name, "ok": None})
+    t0 = time.time()
+    client = None
+    reused = False
+    try:
+        client, reused = _get_ssh_session(
+            host, port or 22, user, password, key_path, key_passphrase,
+            name, 15, strict_host_key,
+        )
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+        except Exception:
+            exit_code = -1
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        elapsed_ms = (time.time() - t0) * 1000
+        result = {
+            "host": host, "user": user, "name": name or None, "reused": reused,
+            "command": command, "exit_code": exit_code,
+            "stdout": out, "stderr": err, "elapsed_ms": round(elapsed_ms, 2),
+        }
+        log_op({"tool": "ssh_exec", "host": host, "user": user, "exit": exit_code, "ok": exit_code == 0})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "ssh_exec", "host": host, "user": user, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+    finally:
+        if not name and client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+@mcp.tool()
+def ssh_upload(
+    host: str, port: int = 22, user: str = "",
+    password: str = "", key_path: str = "", key_passphrase: str = "",
+    local_path: str = "", remote_path: str = "",
+    timeout: float = 30, name: str = "", strict_host_key: bool = False,
+) -> str:
+    """SFTP 上传本地文件到远程主机（自动创建远程父目录）。
+    host/port/user/password/key_path/key_passphrase：同 ssh_exec
+    local_path：本地文件路径
+    remote_path：远程目标路径（绝对或相对 home）
+    name：复用 SSH 会话（不传则每次新建）
+    """
+    if paramiko is None:
+        return "错误：paramiko 未安装"
+    if not host or not user or not local_path or not remote_path:
+        return "错误：host / user / local_path / remote_path 必填"
+    abs_local = os.path.abspath(local_path)
+    if not os.path.exists(abs_local):
+        return f"错误：本地文件不存在：{abs_local}"
+    log_op({"tool": "ssh_upload", "host": host, "user": user, "local": abs_local, "remote": remote_path, "ok": None})
+    t0 = time.time()
+    client = None
+    try:
+        client, _ = _get_ssh_session(
+            host, port or 22, user, password, key_path, key_passphrase,
+            name, 15, strict_host_key,
+        )
+        sftp = client.open_sftp()
+        try:
+            remote_dir = os.path.dirname(remote_path.replace("\\", "/")).rstrip("/")
+            if remote_dir:
+                _sftp_mkdir_p(sftp, remote_dir)
+            sftp.put(abs_local, remote_path)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        elapsed_ms = (time.time() - t0) * 1000
+        size = os.path.getsize(abs_local)
+        result = {
+            "host": host, "user": user, "local": abs_local, "remote": remote_path,
+            "size": size, "elapsed_ms": round(elapsed_ms, 2),
+        }
+        log_op({"tool": "ssh_upload", "host": host, "user": user, "size": size, "ok": True})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "ssh_upload", "host": host, "user": user, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+    finally:
+        if not name and client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+@mcp.tool()
+def ssh_download(
+    host: str, port: int = 22, user: str = "",
+    password: str = "", key_path: str = "", key_passphrase: str = "",
+    remote_path: str = "", local_path: str = "",
+    timeout: float = 30, name: str = "", strict_host_key: bool = False,
+) -> str:
+    """SFTP 下载远程文件到本地。
+    host/port/user/password/key_path/key_passphrase：同 ssh_exec
+    remote_path：远程文件路径
+    local_path：本地目标路径（写入受 MCP_ALLOWED_ROOTS 约束）
+    name：复用 SSH 会话（不传则每次新建）
+    """
+    if paramiko is None:
+        return "错误：paramiko 未安装"
+    if not host or not user or not remote_path or not local_path:
+        return "错误：host / user / remote_path / local_path 必填"
+    abs_local = os.path.abspath(local_path)
+    try:
+        ensure_allowed(os.path.dirname(abs_local) or abs_local)
+    except ValueError as e:
+        return f"错误：{e}"
+    log_op({"tool": "ssh_download", "host": host, "user": user, "remote": remote_path, "local": abs_local, "ok": None})
+    t0 = time.time()
+    client = None
+    try:
+        client, _ = _get_ssh_session(
+            host, port or 22, user, password, key_path, key_passphrase,
+            name, 15, strict_host_key,
+        )
+        sftp = client.open_sftp()
+        try:
+            sftp.get(remote_path, abs_local)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        elapsed_ms = (time.time() - t0) * 1000
+        size = os.path.getsize(abs_local)
+        result = {
+            "host": host, "user": user, "remote": remote_path, "local": abs_local,
+            "size": size, "elapsed_ms": round(elapsed_ms, 2),
+        }
+        log_op({"tool": "ssh_download", "host": host, "user": user, "size": size, "ok": True})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "ssh_download", "host": host, "user": user, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+    finally:
+        if not name and client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+class _SSHForwardServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class _SSHForwardHandler(socketserver.BaseRequestHandler):
+    """每个本地连接一个线程：通过 SSH 通道双向转发。"""
+
+    def handle(self):  # noqa: D401
+        transport = self.server.transport
+        try:
+            # local port forwarding: client → server:remote_host:remote_port
+            # client 端 open_channel("direct-tcpip", ...) 后由 server 端的 check_channel_direct_tcpip_request 接受
+            channel = transport.open_channel(
+                "direct-tcpip",
+                (self.server.remote_host, self.server.remote_port),
+                self.client_address,
+            )
+        except Exception:
+            return
+        if channel is None:
+            return
+        sock = self.request
+        try:
+            while True:
+                r, _, _ = select.select([sock, channel], [], [], 1.0)
+                if sock in r:
+                    try:
+                        data = sock.recv(4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    try:
+                        channel.sendall(data)
+                    except OSError:
+                        break
+                if channel in r:
+                    try:
+                        data = channel.recv(4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    try:
+                        sock.sendall(data)
+                    except OSError:
+                        break
+        finally:
+            try:
+                channel.close()
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+@mcp.tool()
+def ssh_tunnel(
+    host: str, port: int = 22, user: str = "",
+    password: str = "", key_path: str = "", key_passphrase: str = "",
+    local_port: int = 0, remote_host: str = "127.0.0.1", remote_port: int = 0,
+    name: str = "", strict_host_key: bool = False,
+) -> str:
+    """在本地起一个端口转发到远程主机的目标端口。
+    host/port/user/password/key_path/key_passphrase：同 ssh_exec
+    local_port：本地监听端口；0 表示自动分配
+    remote_host / remote_port：转发目标（一般 127.0.0.1:<远程服务端口>）
+    name：注册到会话池（强烈建议传，便于 ssh_disconnect 停止）
+    strict_host_key：是否校验 known_hosts（默认 False）
+    返回 JSON：{name, host, user, local_addr, local_port, remote_host, remote_port, started_at}
+    """
+    if paramiko is None:
+        return "错误：paramiko 未安装"
+    if not host or not user or not remote_port:
+        return "错误：host / user / remote_port 必填"
+    log_op({"tool": "ssh_tunnel", "host": host, "user": user, "remote": f"{remote_host}:{remote_port}", "name": name, "ok": None})
+    try:
+        client = _open_ssh_client(host, port or 22, user, password, key_path, key_passphrase, 15, strict_host_key)
+        transport = client.get_transport()
+        if transport is None:
+            client.close()
+            return "错误：SSH transport 不可用"
+        server = _SSHForwardServer(("127.0.0.1", local_port), _SSHForwardHandler)
+        server.transport = transport
+        server.remote_host = remote_host
+        server.remote_port = remote_port
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True,
+            name=f"ssh-tunnel-{name or 'anon'}-{server.server_address[1]}",
+        )
+        thread.start()
+        actual_port = server.server_address[1]
+        if name:
+            with _SSH_POOL_LOCK:
+                _SSH_POOL[name] = {
+                    "client": client, "server": server, "thread": thread,
+                    "host": host, "port": int(port or 22), "user": user, "ts": time.time(),
+                }
+        result = {
+            "name": name or None,
+            "host": host, "user": user,
+            "local_addr": "127.0.0.1", "local_port": actual_port,
+            "remote_host": remote_host, "remote_port": remote_port,
+            "started_at": _now_iso(),
+        }
+        log_op({"tool": "ssh_tunnel", "host": host, "user": user, "local_port": actual_port, "ok": True})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "ssh_tunnel", "host": host, "user": user, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def ssh_disconnect(name: str = "") -> str:
+    """断开 SSH 会话或停止 SSH 隧道。
+    name：要断的会话名（注册时用的别名）。不传则断开全部。
+    """
+    if paramiko is None:
+        return "错误：paramiko 未安装"
+    if name:
+        log_op({"tool": "ssh_disconnect", "name": name, "ok": None})
+        msg = _close_ssh_session(name)
+        log_op({"tool": "ssh_disconnect", "name": name, "ok": "停止" in msg})
+        return msg
+    # 全部断开
+    with _SSH_POOL_LOCK:
+        names = list(_SSH_POOL.keys())
+    closed = 0
+    for n in names:
+        if "停止" in _close_ssh_session(n):
+            closed += 1
+    log_op({"tool": "ssh_disconnect", "all": True, "count": closed, "ok": True})
+    return f"已停止 {closed} 个会话"
 
 
 if __name__ == "__main__":

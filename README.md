@@ -10,7 +10,7 @@
 | **自动保存**   | 每次写入/编辑立即 `fsync` 落盘并原子替换，不存在"未保存"的中间状态                                |
 | **避免代码丢失** | 任何修改前，自动把上一版备份到 `.coding-mcp-backup/`（带时间戳）；配合原子写入，进程中断、断电也不会丢代码       |
 
-## 提供的工具（共 28 个）
+## 提供的工具（共 36 个）
 
 ### 文件与搜索
 
@@ -58,6 +58,24 @@
 | `db_tables`      | 列出数据库中的所有表                        |
 | `db_schema`      | 查看表结构（字段名/类型/是否可空/默认值）           |
 | `redis_exec`     | 执行 Redis 命令（默认只读）                  |
+
+### API 测试（httpx）
+
+| 工具                  | 作用                                       |
+| ------------------- | ---------------------------------------- |
+| `api_request`       | 发 HTTP/HTTPS 请求（GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS），支持 basic / bearer auth、自动 JSON、超时与重定向控制 |
+| `api_assert`        | 对最近一次响应的断言（status_eq / status_in / header_eq / jsonpath_eq / jsonpath_contains / body_contains / elapsed_lt） |
+| `api_save_response` | 把响应的 body / headers / full 写到本地文件（受 `MCP_ALLOWED_ROOTS` 约束） |
+
+### SSH 远程（paramiko）
+
+| 工具               | 作用                                       |
+| ---------------- | ---------------------------------------- |
+| `ssh_exec`       | 在远程主机执行命令（支持密码 / 私钥 / 自动选 key 格式；可命名复用连接） |
+| `ssh_upload`     | SFTP 上传本地文件到远程（自动创建远程父目录）                |
+| `ssh_download`   | SFTP 下载远程文件到本地（受 `MCP_ALLOWED_ROOTS` 约束） |
+| `ssh_tunnel`     | 起一个本地端口转发到远程目标（local port forwarding）   |
+| `ssh_disconnect` | 断开命名会话（普通 exec 连接或 tunnel 都可断开）         |
 
 ### GUI 与后台服务（解决 run_command 不适合长驻进程的问题）
 
@@ -226,6 +244,141 @@ MCP 重启、退出、被杀，**不会影响已托管的子进程**。子进程
 ### `run_command` 边界
 
 为了从源头避免误用，`run_command` 主动拒绝后端化命令（详见上文命令执行章节）。看到"首词 `start`/`nohup`/..."错误时，就知道该用 `launch_gui` 或 `service_start` 了。
+
+## API 测试（httpx）
+
+不需要启动浏览器/写脚本，直接让 AI 助手打 HTTP 请求 + 解析响应 + 断言。
+
+### `api_request` — 发请求
+
+```python
+api_request(
+    url="https://httpbin.org/post",
+    method="POST",
+    headers='{"X-Custom":"foo"}',        # JSON 字符串
+    body='{"hello":"world"}',             # 不指定 Content-Type 时自动识别
+    auth_type="bearer",                   # "" | "basic" | "bearer"
+    auth_token="your-token",
+    timeout=30,
+    follow_redirects=True,
+    verify_ssl=True,
+    save_as="login",                      # 给这次响应起名，便于 api_assert 引用
+)
+```
+
+返回 JSON：含 `status_code` / `headers` / `body` / `body_size` / `elapsed_ms` / `json`（自动解析） / `ref`。
+
+### `api_assert` — 多类型断言
+
+```python
+api_assert(checks="""
+[
+  {"type":"status_eq","value":200},
+  {"type":"elapsed_lt","value":2000},
+  {"type":"jsonpath_eq","path":"$.user.id","value":42},
+  {"type":"jsonpath_contains","path":"$.roles","value":"admin"},
+  {"type":"body_contains","value":"OK"},
+  {"type":"header_eq","key":"Content-Type","value":"application/json","contains":true}
+]
+""")
+```
+
+支持的断言类型：
+
+| type                | 字段                    | 说明                       |
+| ------------------- | --------------------- | ------------------------ |
+| `status_eq`         | `value`               | 状态码等于某值                  |
+| `status_in`         | `value`               | 状态码在列表中                  |
+| `header_eq`         | `key`, `value`, `contains` | header 等于/包含某值（默认等于）  |
+| `jsonpath_eq`       | `path`, `value`       | JSONPath 取值等/包含某值        |
+| `jsonpath_contains` | `path`, `value`       | JSONPath 取值是数组/字符串且包含 value |
+| `body_contains`     | `value`               | 响应 body 包含某子串            |
+| `elapsed_lt`        | `value`               | 响应时间（ms）小于某值             |
+
+JSONPath 语法支持：`$.a.b.c` / `$.a[0].b` / `$.arr[2]`。
+
+### `api_save_response` — 把响应落盘
+
+适合下载大文件 / 留作重放样本：
+
+```python
+api_save_response(path="out.json", part="full")     # body / headers / full
+api_save_response(path="dump.bin", part="body", overwrite=False)
+```
+
+写入路径受 `MCP_ALLOWED_ROOTS` 约束。
+
+## SSH 远程（paramiko）
+
+支持两种用法：
+
+- **临时连接**：每次 `ssh_exec` 都新建 SSH 连接，用完即关（不传 `name`）
+- **连接池**：传 `name="xxx"` 注册到池中，后续同名调用复用（节省握手）
+
+### `ssh_exec` — 执行远程命令
+
+```python
+# 临时连接
+ssh_exec(host="192.168.1.10", port=22, user="root",
+         password="xxx",
+         command="uptime && df -h | head -5",
+         timeout=30)
+
+# 私钥登录
+ssh_exec(host="server.local", user="deploy",
+         key_path="~/.ssh/id_ed25519",
+         command="systemctl status nginx")
+
+# 命名复用
+ssh_exec(host="...", user="...", password="...",
+         name="prod-1",
+         command="hostname")
+ssh_exec(host="...", user="...", password="...",
+         name="prod-1",                # 同名 → 复用
+         command="uptime")
+```
+
+返回 JSON：含 `exit_code` / `stdout` / `stderr` / `elapsed_ms` / `reused`。
+
+### `ssh_upload` / `ssh_download` — SFTP 文件传输
+
+```python
+ssh_upload(host="...", user="...", password="...",
+           local_path="./build/release.tar.gz",
+           remote_path="/opt/app/release.tar.gz")  # 自动创建远程父目录
+
+ssh_download(host="...", user="...", password="...",
+             remote_path="/var/log/app.log",
+             local_path="./logs/app.log")          # 写入受 MCP_ALLOWED_ROOTS 约束
+```
+
+### `ssh_tunnel` — 本地端口转发
+
+把远程服务"拉到"本地端口上，再用 localhost 访问（无需配置 SSH config）：
+
+```python
+ssh_tunnel(host="db.internal", user="ops", password="...",
+           local_port=13306,                     # 本地监听 0=自动分配
+           remote_host="127.0.0.1", remote_port=3306,  # 远程目标
+           name="mysql-tunnel")
+# → 127.0.0.1:13306 现在等价于 127.0.0.1:3306（从 db.internal 看）
+```
+
+返回 JSON 含分配到的 `local_port`，`ssh_disconnect(name="mysql-tunnel")` 停止。
+
+### `ssh_disconnect` — 释放会话
+
+```python
+ssh_disconnect(name="prod-1")       # 断一条
+ssh_disconnect()                    # 断全部
+```
+
+### 凭据与安全
+
+- **凭据以工具参数显式传**（最透明，敏感信息审计可见）
+- `strict_host_key=False` 默认（适合内网开发/家用网络；正式环境可改 True 启用 known_hosts 校验）
+- `name` 命名的连接池是**进程内**的——MCP 重启后会失效
+- 写操作（`write_all=True` 等）**不支持**——本套工具只做 exec / 拉文件 / 隧道，不做远程命令拼装的写操作
 
 ## 预制开发流程（dev-context）
 

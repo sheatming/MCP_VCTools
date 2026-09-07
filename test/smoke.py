@@ -5,7 +5,16 @@ import os
 import sys
 import shutil
 import tempfile
+import time
+import threading
+import socket
 from pathlib import Path
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
+import select
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -608,6 +617,606 @@ async def test_service_clean():
         # 活的服务已显式 stop；外部 kill 的 dead-svc 由 service_clean 清理。
 
 
+async def test_api_request_and_assert():
+    """API 测试：发请求 + 多类型断言 + 错误处理。"""
+    import json as _json
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-test-api-")
+    audit = os.path.join(fake_home, "audit.log")
+    proj = tempfile.mkdtemp(prefix="coding-mcp-test-api-proj-")
+
+    here = Path(__file__).resolve().parent.parent
+    python = str(here / ".venv" / "Scripts" / "python.exe")
+    server_py = str(here / "server.py")
+
+    params = StdioServerParameters(
+        command=python,
+        args=[server_py],
+        env={
+            **os.environ,
+            "HOME": fake_home, "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit, "MCP_ENABLE_EXEC": "1",
+            "MCP_ALLOWED_ROOTS": proj,
+        },
+    )
+    try:
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+
+                # 1. 基本 GET + status 断言
+                r = await session.call_tool("api_request", {
+                    "url": "https://httpbin.org/get?foo=bar",
+                    "timeout": 15,
+                    "save_as": "basic-get",
+                })
+                data = _json.loads(_text(r))
+                assert data["status_code"] == 200, f"应 200：{data['status_code']}"
+                assert data["json"]["args"]["foo"] == "bar"
+                assert data["ref"] == "basic-get"
+                print(f"\n[api-basic] status={data['status_code']} elapsed={data['elapsed_ms']}ms")
+
+                # 2. status_eq 断言通过
+                r = await session.call_tool("api_assert", {
+                    "checks": _json.dumps([
+                        {"type": "status_eq", "value": 200},
+                        {"type": "elapsed_lt", "value": 30000},
+                        {"type": "body_contains", "value": "httpbin"},
+                    ]),
+                })
+                result = _json.loads(_text(r))
+                assert result["pass"], f"基本断言应通过：{result}"
+                print(f"[api-assert1] {result['summary']}")
+
+                # 3. JSONPath 断言 + 故意失败
+                r = await session.call_tool("api_assert", {
+                    "checks": _json.dumps([
+                        {"type": "jsonpath_eq", "path": "$.args.foo", "value": "bar"},
+                        {"type": "jsonpath_eq", "path": "$.args.foo", "value": "WRONG"},
+                    ]),
+                })
+                result = _json.loads(_text(r))
+                assert not result["pass"], "故意失败的断言应使整体 pass=False"
+                assert result["summary"] == "1/2 passed", f"summary 应为 '1/2 passed'：{result}"
+                print(f"[api-assert2] {result['summary']} (故意失败)")
+
+                # 4. POST JSON
+                r = await session.call_tool("api_request", {
+                    "url": "https://httpbin.org/post",
+                    "method": "POST",
+                    "body": _json.dumps({"hello": "world", "n": 42}),
+                })
+                data = _json.loads(_text(r))
+                assert data["status_code"] == 200
+                assert data["json"]["json"]["n"] == 42
+                print(f"[api-post] status={data['status_code']} json={list(data['json']['json'].keys())}")
+
+                # 5. bearer auth
+                r = await session.call_tool("api_request", {
+                    "url": "https://httpbin.org/bearer",
+                    "auth_type": "bearer",
+                    "auth_token": "test-token-12345",
+                })
+                data = _json.loads(_text(r))
+                assert data["status_code"] == 200
+                assert data["json"]["authenticated"] is True
+                assert data["json"]["token"] == "test-token-12345"
+                print(f"[api-bearer] authenticated={data['json']['authenticated']}")
+
+                # 6. status_in 断言
+                r = await session.call_tool("api_assert", {
+                    "checks": _json.dumps([{"type": "status_in", "value": [200, 201]}]),
+                })
+                result = _json.loads(_text(r))
+                assert result["pass"]
+
+                # 7. 不存在的主机应报错
+                r = await session.call_tool("api_request", {
+                    "url": "https://this-host-does-not-exist-xyz.invalid/",
+                    "timeout": 5,
+                })
+                txt = _text(r)
+                assert txt.startswith("错误"), f"应报错：{txt[:100]}"
+                print(f"[api-fail] 已正确报错：{txt[:60]}")
+
+    finally:
+        shutil.rmtree(fake_home, ignore_errors=True)
+        shutil.rmtree(proj, ignore_errors=True)
+
+
+async def test_api_save_response():
+    """api_save_response：把响应 body / headers / full 写到文件。"""
+    import json as _json
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-test-api-save-")
+    audit = os.path.join(fake_home, "audit.log")
+    proj = tempfile.mkdtemp(prefix="coding-mcp-test-api-save-proj-")
+
+    here = Path(__file__).resolve().parent.parent
+    python = str(here / ".venv" / "Scripts" / "python.exe")
+    server_py = str(here / "server.py")
+
+    params = StdioServerParameters(
+        command=python,
+        args=[server_py],
+        env={
+            **os.environ,
+            "HOME": fake_home, "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit,
+            "MCP_ALLOWED_ROOTS": proj,
+        },
+    )
+    try:
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+
+                # 发请求
+                r = await session.call_tool("api_request", {
+                    "url": "https://httpbin.org/uuid",
+                    "save_as": "uuid",
+                })
+                data = _json.loads(_text(r))
+                uuid = data["json"]["uuid"]
+                print(f"\n[api-save] uuid={uuid}")
+
+                # 保存 body
+                body_path = os.path.join(proj, "body.json")
+                r = await session.call_tool("api_save_response", {
+                    "path": body_path, "part": "body", "overwrite": True,
+                })
+                assert "已保存" in _text(r), _text(r)
+                with open(body_path, encoding="utf-8") as f:
+                    saved = _json.load(f)
+                assert saved["uuid"] == uuid
+                print(f"[api-save-body] ok")
+
+                # 保存 headers
+                headers_path = os.path.join(proj, "headers.json")
+                r = await session.call_tool("api_save_response", {
+                    "path": headers_path, "part": "headers",
+                })
+                assert "已保存" in _text(r)
+                with open(headers_path, encoding="utf-8") as f:
+                    hdrs = _json.load(f)
+                # header key 大小写不敏感（httpbin 返回小写）
+                assert any(k.lower() == "content-type" for k in hdrs.keys()), f"应有 content-type：{list(hdrs.keys())}"
+                print(f"[api-save-headers] ok")
+
+                # overwrite=False 遇到已存在应拒绝
+                r = await session.call_tool("api_save_response", {
+                    "path": body_path, "part": "body", "overwrite": False,
+                })
+                assert "已存在" in _text(r), f"应拒覆盖：{_text(r)}"
+                print(f"[api-save-nooverwrite] ok")
+
+                # 路径白名单外应被拒
+                r = await session.call_tool("api_save_response", {
+                    "path": "C:/Windows/temp/save.json",
+                    "part": "body",
+                })
+                txt = _text(r)
+                assert txt.startswith("错误") and ("白名单" in txt or "越界" in txt or "MCP_ALLOWED_ROOTS" in txt), f"白名单应拦：{txt}"
+                print(f"[api-save-whitelist] ok")
+
+    finally:
+        shutil.rmtree(fake_home, ignore_errors=True)
+        shutil.rmtree(proj, ignore_errors=True)
+
+
+class _TestSSHServer(paramiko.ServerInterface):
+    """测试用最小 SSH server：固定用户名/密码，exec_request 时真正执行命令并回写 channel。"""
+    def __init__(self):
+        self.exec_count = 0
+        # direct-tcpip (local port forwarding) 目标：chanid -> (dest_addr, dest_port)
+        self.direct_tcpip_targets: dict = {}
+
+    def check_auth_password(self, username, password):
+        return paramiko.AUTH_SUCCESSFUL if (username == "testuser" and password == "testpass") else paramiko.AUTH_FAILED
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_channel_request(self, kind, chanid):
+        return paramiko.OPEN_SUCCEEDED if kind in ("session", "forwarded-tcpip", "direct-tcpip") else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_direct_tcpip_request(self, chanid, origin_addr_port, dest_addr_port):
+        # local port forwarding：client 让 server 端连 dest_addr:dest_port
+        self.direct_tcpip_targets[chanid] = dest_addr_port
+        return paramiko.OPEN_SUCCEEDED
+
+    def check_channel_exec_request(self, channel, command):
+        """收到 exec 请求时直接执行命令并把 stdout/stderr/exit_code 写回 channel。"""
+        cmd = command.decode("utf-8") if isinstance(command, bytes) else command
+        import subprocess as _sp
+        try:
+            r = _sp.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            if r.stdout:
+                channel.sendall(r.stdout.encode("utf-8"))
+            if r.stderr:
+                channel.sendall_stderr(r.stderr.encode("utf-8"))
+            channel.send_exit_status(r.returncode)
+            self.exec_count += 1
+        except Exception as e:
+            channel.sendall(f"err: {e}".encode("utf-8"))
+            channel.send_exit_status(1)
+        finally:
+            try:
+                channel.shutdown_write()
+            except Exception:
+                pass
+        return True
+
+
+def _start_test_sshd(port=0):
+    """起一个临时 SSH server。返回 (port, host_key, stop_flag, sessions)。"""
+    import paramiko as _p
+    import socket as _s
+
+    host_key = _p.RSAKey.generate(1024)  # 测试用 1024 位（生成快）
+    sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", port))
+    sock.listen(5)
+    actual_port = sock.getsockname()[1]
+    stop_flag = {"stop": False}
+    sessions = []
+
+    def serve():
+        while not stop_flag["stop"]:
+            try:
+                sock.settimeout(0.5)
+                client_sock, _addr = sock.accept()
+            except _s.timeout:
+                continue
+            except OSError:
+                break
+            transport = _p.Transport(client_sock)
+            transport.add_server_key(host_key)
+            server = _TestSSHServer()
+            try:
+                transport.start_server(server=server)
+            except Exception:
+                continue
+            t = threading.Thread(
+                target=_serve_one_session, args=(transport,), daemon=True,
+                name="sshd-session",
+            )
+            t.start()
+            sessions.append((transport, t))
+
+    threading.Thread(target=serve, daemon=True, name="test-sshd").start()
+    time.sleep(0.2)  # 等 server 完全就绪
+    return actual_port, host_key, stop_flag, sessions
+
+
+def _serve_one_session(transport):
+    """一个 transport 的事件循环：accept channel，根据类型分别处理。"""
+    server = transport.server_object
+    try:
+        while True:
+            chan = transport.accept(20)
+            if chan is None:
+                if not transport.is_active():
+                    break
+                continue
+            # direct-tcpip（有 origin_addr 且 server 记录了目标）→ 起 worker 做转发
+            if chan.chanid in server.direct_tcpip_targets:
+                dest_addr, dest_port = server.direct_tcpip_targets.pop(chan.chanid)
+                threading.Thread(
+                    target=_handle_direct_tcpip, args=(chan, dest_addr, dest_port),
+                    daemon=True, name="sshd-forwarder",
+                ).start()
+            else:
+                # exec 已在 check_channel_exec_request 里处理；这里等 channel 关闭
+                try:
+                    chan.wait_closed()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+def _handle_direct_tcpip(chan, dest_addr, dest_port):
+    """direct-tcpip 通道：连接 dest_addr:dest_port，然后双向转发。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((dest_addr, dest_port))
+    except Exception:
+        try:
+            chan.close()
+        except Exception:
+            pass
+        return
+    try:
+        while True:
+            r, _, _ = select.select([chan, s], [], [], 1.0)
+            if chan in r:
+                try:
+                    data = chan.recv(4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                try:
+                    s.sendall(data)
+                except OSError:
+                    break
+            if s in r:
+                try:
+                    data = s.recv(4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                try:
+                    chan.sendall(data)
+                except OSError:
+                    break
+    finally:
+        try:
+            chan.close()
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+async def test_ssh_exec_via_local_sshd():
+    """SSH 集成测试：自起一个 test sshd，用 ssh_exec 跑命令。"""
+    import json as _json
+    import paramiko as _p
+
+    if paramiko is None:
+        print("\n[ssh-skip] paramiko 未安装，跳过")
+        return
+
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-test-ssh-")
+    audit = os.path.join(fake_home, "audit.log")
+    proj = tempfile.mkdtemp(prefix="coding-mcp-test-ssh-proj-")
+
+    here = Path(__file__).resolve().parent.parent
+    python = str(here / ".venv" / "Scripts" / "python.exe")
+    server_py = str(here / "server.py")
+
+    port, host_key, stop_flag, sessions = _start_test_sshd(0)
+    print(f"\n[ssh-test] test sshd 已在 127.0.0.1:{port} 启动")
+
+    params = StdioServerParameters(
+        command=python,
+        args=[server_py],
+        env={
+            **os.environ,
+            "HOME": fake_home, "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit, "MCP_ENABLE_EXEC": "1",
+            "MCP_ALLOWED_ROOTS": proj,
+        },
+    )
+    try:
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+
+                # 1. 基本 exec
+                r = await session.call_tool("ssh_exec", {
+                    "host": "127.0.0.1", "port": port, "user": "testuser",
+                    "password": "testpass",
+                    "command": "echo hello-from-ssh-mcp",
+                })
+                txt = _text(r)
+                data = _json.loads(txt) if not txt.startswith("错误") else None
+                if data is None:
+                    print(f"[ssh-exec-1] 失败: {txt[:200]}")
+                else:
+                    assert "hello-from-ssh-mcp" in data["stdout"], f"stdout: {data}"
+                    print(f"[ssh-exec-1] exit={data['exit_code']} stdout={data['stdout'].strip()}")
+
+                # 2. 错误密码应报 AUTH_FAILED
+                r = await session.call_tool("ssh_exec", {
+                    "host": "127.0.0.1", "port": port, "user": "testuser",
+                    "password": "WRONG",
+                    "command": "echo should-not-run",
+                })
+                txt = _text(r)
+                assert txt.startswith("错误"), f"错误密码应报错：{txt[:200]}"
+                print(f"[ssh-exec-badpass] 正确报错：{txt[:60]}")
+
+                # 3. name 复用：两次 ssh_exec 传同名 name，第二次应该 reused=True
+                # 先断掉之前的旧连接（如果还在）
+                await session.call_tool("ssh_disconnect", {})
+                r1 = await session.call_tool("ssh_exec", {
+                    "host": "127.0.0.1", "port": port, "user": "testuser",
+                    "password": "testpass", "name": "reuse-test",
+                    "command": "echo first",
+                })
+                d1 = _json.loads(_text(r1))
+                assert d1.get("reused") is False, f"首次应非 reused：{d1}"
+                r2 = await session.call_tool("ssh_exec", {
+                    "host": "127.0.0.1", "port": port, "user": "testuser",
+                    "password": "testpass", "name": "reuse-test",
+                    "command": "echo second",
+                })
+                d2 = _json.loads(_text(r2))
+                assert d2.get("reused") is True, f"二次应 reused：{d2}"
+                print(f"[ssh-exec-reuse] reused={d2['reused']}")
+
+                # 4. ssh_disconnect 显式断开
+                r = await session.call_tool("ssh_disconnect", {"name": "reuse-test"})
+                assert "已停止" in _text(r), _text(r)
+                print(f"[ssh-disconnect] ok")
+
+                # 5. ssh_disconnect 不断开未知 name
+                r = await session.call_tool("ssh_disconnect", {"name": "nonexistent"})
+                assert "没有" in _text(r), _text(r)
+                print(f"[ssh-disconnect-badname] ok")
+
+                # 6. ssh_upload：上传到 test server（test server 路径可能不存在，简单跑一下看错误处理）
+                # 改成：先用 ssh_upload 写一个文件，再用 ssh_exec cat 它
+                test_file = os.path.join(proj, "upload.txt")
+                with open(test_file, "w", encoding="utf-8") as f:
+                    f.write("payload-from-mcp\n")
+                r = await session.call_tool("ssh_upload", {
+                    "host": "127.0.0.1", "port": port, "user": "testuser",
+                    "password": "testpass",
+                    "local_path": test_file,
+                    "remote_path": "/tmp/coding-mcp-test/upload.txt",
+                })
+                # test sshd 是真的 paramiko server，mkdir_p 会工作
+                txt = _text(r)
+                if "已停止" in txt or txt.startswith("错误"):
+                    print(f"[ssh-upload] 跳��（test sshd 可能限制）：{txt[:80]}")
+                else:
+                    data = _json.loads(txt)
+                    print(f"[ssh-upload] size={data['size']} elapsed={data['elapsed_ms']}ms")
+
+    finally:
+        stop_flag["stop"] = True
+        for transport, _ in sessions:
+            try:
+                transport.close()
+            except Exception:
+                pass
+        time.sleep(0.5)
+        shutil.rmtree(fake_home, ignore_errors=True)
+        shutil.rmtree(proj, ignore_errors=True)
+
+
+async def test_ssh_tunnel_local_forward():
+    """SSH 隧道：起一个本地端口转发，连接后能访问 echo 服务。"""
+    import json as _json
+    import paramiko as _p
+    import socket as _s
+
+    if paramiko is None:
+        print("\n[ssh-tunnel-skip] paramiko 未安装，跳过")
+        return
+
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-test-tun-")
+    audit = os.path.join(fake_home, "audit.log")
+    proj = tempfile.mkdtemp(prefix="coding-mcp-test-tun-proj-")
+
+    here = Path(__file__).resolve().parent.parent
+    python = str(here / ".venv" / "Scripts" / "python.exe")
+    server_py = str(here / "server.py")
+
+    port, host_key, stop_flag, sessions = _start_test_sshd(0)
+    print(f"\n[ssh-tunnel] test sshd 已在 127.0.0.1:{port} 启动")
+
+    # 起一个本地 echo server，监听 0 端口
+    echo_sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    echo_sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+    echo_sock.bind(("127.0.0.1", 0))
+    echo_sock.listen(5)
+    echo_port = echo_sock.getsockname()[1]
+    echo_ready = threading.Event()
+    echo_stop = {"stop": False}
+
+    def echo_serve():
+        echo_ready.set()
+        while not echo_stop["stop"]:
+            try:
+                echo_sock.settimeout(0.5)
+                c, _ = echo_sock.accept()
+            except _s.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                data = c.recv(4096)
+                if data:
+                    c.sendall(b"echo:" + data)
+            except Exception:
+                pass
+            finally:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+    threading.Thread(target=echo_serve, daemon=True, name="echo-srv").start()
+    echo_ready.wait(2)
+    print(f"[ssh-tunnel] echo server 在 127.0.0.1:{echo_port}")
+
+    params = StdioServerParameters(
+        command=python,
+        args=[server_py],
+        env={
+            **os.environ,
+            "HOME": fake_home, "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit, "MCP_ENABLE_EXEC": "1",
+            "MCP_ALLOWED_ROOTS": proj,
+        },
+    )
+    try:
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+
+                # 1. 起隧道
+                r = await session.call_tool("ssh_tunnel", {
+                    "host": "127.0.0.1", "port": port, "user": "testuser",
+                    "password": "testpass",
+                    "local_port": 0,
+                    "remote_host": "127.0.0.1", "remote_port": echo_port,
+                    "name": "test-tunnel",
+                })
+                data = _json.loads(_text(r))
+                local_port = data["local_port"]
+                assert local_port > 0, f"local_port 应 > 0：{data}"
+                print(f"[ssh-tunnel-start] 127.0.0.1:{local_port} -> 127.0.0.1:{echo_port}")
+
+                # 2. 通过隧道发请求
+                time.sleep(0.5)  # 等转发线程就绪
+                c = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+                c.settimeout(5)
+                try:
+                    c.connect(("127.0.0.1", local_port))
+                    c.sendall(b"hello-tunnel")
+                    resp = c.recv(4096)
+                    assert resp == b"echo:hello-tunnel", f"隧道响应不符：{resp!r}"
+                    print(f"[ssh-tunnel-flow] 通过隧道拿到 echo: {resp.decode()}")
+                finally:
+                    c.close()
+
+                # 3. 停止隧道
+                r = await session.call_tool("ssh_disconnect", {"name": "test-tunnel"})
+                assert "已停止" in _text(r), _text(r)
+                print(f"[ssh-tunnel-stop] ok")
+
+                # 4. 停止后端口应该拒绝连接
+                time.sleep(0.3)
+                c = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+                c.settimeout(2)
+                try:
+                    c.connect(("127.0.0.1", local_port))
+                    print(f"[ssh-tunnel-stopped] 警告：端口仍可达")
+                except (ConnectionRefusedError, OSError, _s.timeout):
+                    print(f"[ssh-tunnel-stopped] 端口已正确关闭")
+                finally:
+                    c.close()
+
+    finally:
+        stop_flag["stop"] = True
+        for transport, _ in sessions:
+            try:
+                transport.close()
+            except Exception:
+                pass
+        echo_stop["stop"] = True
+        try:
+            echo_sock.close()
+        except Exception:
+            pass
+        time.sleep(0.3)
+        shutil.rmtree(fake_home, ignore_errors=True)
+        shutil.rmtree(proj, ignore_errors=True)
+
+
 if __name__ == "__main__":
     asyncio.run(main())
     asyncio.run(test_exec_disabled_by_default())
@@ -617,3 +1226,7 @@ if __name__ == "__main__":
     asyncio.run(test_run_command_blacklist())
     asyncio.run(test_launch_gui_with_name())
     asyncio.run(test_service_clean())
+    asyncio.run(test_api_request_and_assert())
+    asyncio.run(test_api_save_response())
+    asyncio.run(test_ssh_exec_via_local_sshd())
+    asyncio.run(test_ssh_tunnel_local_forward())

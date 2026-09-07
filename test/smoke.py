@@ -617,6 +617,125 @@ async def test_service_clean():
         # 活的服务已显式 stop；外部 kill 的 dead-svc 由 service_clean 清理。
 
 
+async def test_service_restart():
+    """service_restart：一步重启（stop + start），复用注册表里的原 command / working_dir。
+    验证：
+      - 旧 PID 被替换为新 PID
+      - 进程在重启后仍存活
+      - truncate_logs=True 会清空旧日志
+      - 对未注册的名字报错
+      - 旧进程已死时也能重启（读注册表即可）"""
+    import subprocess as sp
+    import time as time_mod
+
+    here = Path(__file__).resolve().parent.parent
+    server_py = here / "server.py"
+    python = here / ".venv" / "Scripts" / "python.exe"
+    if not python.exists():
+        python = here / ".venv" / "bin" / "python"
+
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-home-restart-")
+    audit = os.path.join(fake_home, "audit.log")
+    services_root = os.path.join(fake_home, "services")
+    os.makedirs(services_root, exist_ok=True)
+
+    params = StdioServerParameters(
+        command=str(python),
+        args=[str(server_py)],
+        env={
+            **os.environ,
+            "HOME": fake_home,
+            "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit,
+            "MCP_ENABLE_EXEC": "1",
+        },
+    )
+    try:
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                assert "service_restart" in [t.name for t in tools.tools], "service_restart 未注册"
+
+                svc_name = "smoke-svc-restart"
+                # 注意：stdout 重定向到文件后是块缓冲，必须显式 flush 才能及时读到
+                cmd = f'"{python}" -c "import sys, time; print(\'restarted\'); sys.stdout.flush(); time.sleep(120)"'
+
+                # ---- 1. 启动 ----
+                r = await session.call_tool("service_start", {"name": svc_name, "command": cmd})
+                assert _json.loads(_text(r))["name"] == svc_name
+                first_entry = _json.loads(_text(r))
+                first_pid = first_entry["pid"]
+                time_mod.sleep(1.5)
+
+                # 写点东西到日志（用于验证 truncate_logs）
+                r = await session.call_tool("service_logs", {"name": svc_name, "stream": "stdout", "tail_lines": 10})
+                first_logs = _json.loads(_text(r))
+                assert "restarted" in (first_logs.get("stdout") or "")
+
+                # ---- 2. service_restart（温和）：应替换 PID ----
+                r = await session.call_tool("service_restart", {"name": svc_name, "force": False, "timeout": 10})
+                print("\n[restart-soft]", _text(r)[:400])
+                result = _json.loads(_text(r))
+                assert result["ok"] is True, f"restart 应 ok：{result}"
+                assert result["before"]["pid"] == first_pid, "before 应是旧 PID"
+                assert result["before"]["alive"] is True
+                assert result["stopped"]["stopped"] is True
+                assert result["started"]["pid"] != first_pid, "新 PID 应与旧 PID 不同"
+                assert result["started"]["command"] == cmd, "应复用原 command"
+                new_pid = result["started"]["pid"]
+                time_mod.sleep(1.5)
+
+                # 查 status：旧 PID 应已死，新 PID 应活
+                # 用 tasklist 直接验证两个 PID
+                out = sp.run(
+                    ["tasklist", "/FI", f"PID eq {new_pid}", "/NH", "/FO", "CSV"],
+                    capture_output=True, timeout=5,
+                ).stdout.decode("utf-8", errors="replace")
+                assert "INFO:" not in out, f"新 PID {new_pid} 应仍存活"
+
+                # ---- 3. truncate_logs=True：再次重启，旧 stdout 应被清空 ----
+                # 先让新进程再写一行，确认它真在跑
+                time_mod.sleep(1.0)
+                r = await session.call_tool(
+                    "service_restart",
+                    {"name": svc_name, "force": True, "timeout": 5, "truncate_logs": True},
+                )
+                print("[restart-trunc]", _text(r)[:300])
+                result2 = _json.loads(_text(r))
+                assert result2["ok"] is True
+                assert result2["started"]["pid"] != new_pid, "应再次拿到新 PID"
+                trunc_pid = result2["started"]["pid"]
+                time_mod.sleep(1.5)
+
+                # 日志应被清空再重写：旧 "restarted" 已被 truncate，新进程会再打一次
+                r = await session.call_tool("service_logs", {"name": svc_name, "stream": "stdout", "tail_lines": 20})
+                logs2 = _json.loads(_text(r))
+                stdout_text = logs2.get("stdout") or ""
+                # truncate 后只剩新进程的那一行（最多 1 次 "restarted"），不会出现 2 段
+                assert stdout_text.count("restarted") <= 1, f"truncate_logs 后不应有多段历史：{stdout_text!r}"
+
+                # ---- 4. 未注册的名字：应报错 ----
+                r = await session.call_tool("service_restart", {"name": "no-such-service-xyz"})
+                assert "未找到" in _text(r), f"未注册应报错：{_text(r)}"
+
+                # ---- 5. 旧进程已死时也能重启：手动 kill 后再 restart ----
+                sp.run(["taskkill", "/F", "/PID", str(trunc_pid), "/T"], capture_output=True, timeout=5)
+                time_mod.sleep(1.0)
+                r = await session.call_tool("service_restart", {"name": svc_name, "force": False})
+                result3 = _json.loads(_text(r))
+                print("[restart-after-kill]", _text(r)[:300])
+                assert result3["ok"] is True, f"旧进程已死后 restart 也应 ok：{result3}"
+                assert result3["before"]["alive"] is False, "before.alive 应为 False"
+                assert result3["started"]["pid"] != trunc_pid
+
+                # ---- 6. 清理 ----
+                await session.call_tool("service_stop", {"name": svc_name, "force": True})
+    finally:
+        shutil.rmtree(fake_home, ignore_errors=True)
+        # 服务进程已显式 stop；不再需要 taskkill /IM。
+
+
 async def test_api_request_and_assert():
     """API 测试：发请求 + 多类型断言 + 错误处理。"""
     import json as _json
@@ -1226,6 +1345,7 @@ if __name__ == "__main__":
     asyncio.run(test_run_command_blacklist())
     asyncio.run(test_launch_gui_with_name())
     asyncio.run(test_service_clean())
+    asyncio.run(test_service_restart())
     asyncio.run(test_api_request_and_assert())
     asyncio.run(test_api_save_response())
     asyncio.run(test_ssh_exec_via_local_sshd())

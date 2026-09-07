@@ -192,7 +192,7 @@ service_logs(name='my-app', stream='stdout')   # 看日志
 service_stop(name='my-app')    # 优雅停止
 ```
 
-### `service_start` / `service_stop` / `service_status` / `service_logs` — 后台守护
+### `service_start` / `service_stop` / `service_restart` / `service_status` / `service_logs` — 后台守护
 
 | 场景 | 用法 |
 | --- | --- |
@@ -202,6 +202,32 @@ service_stop(name='my-app')    # 优雅停止
 | 看日志末尾 100 行 | `service_logs(name='web', stream='stdout', tail_lines=100)` |
 | 优雅停止 | `service_stop(name='web')` |
 | 强杀（不优雅） | `service_stop(name='web', force=True)` |
+| **重启（推荐 dev server 改完配置后用）** | `service_restart(name='web')` |
+| **重启并清空日志**（HMR 卡死时用） | `service_restart(name='web', truncate_logs=True)` |
+
+### `service_restart` — 一步重启
+
+`service_stop` + `service_start` 二次调用的封装。复用注册表里已存的 `command` / `working_dir` / `log_dir`，**不需要重新传一遍参数**。
+
+典型场景：
+- **改完 `vite.config.ts` / `webpack.config.js` / `pubspec.yaml`**：HMR 通常不接管，必须重启
+- **HMR 卡死 / dev server 状态污染**：重启并选 `truncate_logs=True` 拿到干净日志
+- **依赖装完 / 环境变量改了**：快速重启复用同一份配置
+
+```
+service_restart(name='web')
+# → {"ok":true, "before":{pid:1234,alive:true}, "stopped":{stopped:true,took_ms:80},
+#    "started":{pid:5678, started_at:"..."}, "elapsed_ms":1100}
+
+service_restart(name='web', force=True, timeout=5)   # 强杀旧进程
+service_restart(name='web', truncate_logs=True)      # 同时清空 stdout/stderr 日志
+```
+
+返回结构中：
+- `before`：旧进程 PID / 是否存活 / 启动时间
+- `stopped`：停止是否成功、用了多少毫秒、是否强杀
+- `started`：新进程 PID / 启动时间 / 注册表完整条目
+- `ok=false`：停止失败时返回（保留旧进程，便于排查），新进程立即退出时返回错误文本（不会留半死状态）
 
 ### `service_clean` — 清理孤儿
 

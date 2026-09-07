@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover
 
 from mcp.server.mcpserver import MCPServer
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -1736,6 +1736,179 @@ def service_stop(
         )
     except Exception as e:  # noqa: BLE001
         log_op({"tool": "service_stop", "name": name, "ok": False, "error": str(e)})
+        return f"错误：{e}"
+
+
+@mcp.tool()
+def service_restart(
+    name: str,
+    force: bool = False,
+    timeout: float = 10.0,
+    truncate_logs: bool = False,
+) -> str:
+    """重启一个由 service_start 启动的后台服务（stop + start 一步完成）。
+    name：服务标识。
+    force：是否强制停止（默认 False：先温和发信号，10 秒不退再强杀）。
+    timeout：等待停止的秒数（默认 10）。
+    truncate_logs：是否清空原 stdout/stderr 日志（默认 False 保留历史；HMR 卡死 / 想要干净日志时设 True）。
+    ⚠️ 需开启 MCP_ENABLE_EXEC=1。复用注册表里的原 command / working_dir / log_dir。
+    返回 JSON：{
+      name, ok: bool,
+      before:  {pid, alive, started_at},       # 重启前
+      stopped: {stopped, took_ms, forced},     # 旧进程的停止结果
+      started: {pid, started_at, command, working_dir, log_files}, # 新进程
+      elapsed_ms
+    }"""
+    if not EXEC_ENABLED:
+        return "错误：命令执行未开启。请设置 MCP_ENABLE_EXEC=1。"
+    try:
+        try:
+            name = _validate_service_name(name)
+        except ValueError as e:
+            return f"错误：{e}"
+
+        # 1. 找到原服务配置
+        services = _read_registry()
+        entry = next((s for s in services if s.get("name") == name), None)
+        if entry is None:
+            return f"错误：未找到服务 {name!r}（未通过 service_start 注册）"
+
+        original_command = entry.get("command", "") or ""
+        original_cwd = entry.get("working_dir") or ""
+        original_log_dir = entry.get("log_dir") or ""
+        old_pid = int(entry.get("pid", 0))
+        was_alive = _pid_alive(old_pid)
+
+        log_op({"tool": "service_restart", "name": name, "old_pid": old_pid, "was_alive": was_alive, "ok": None})
+        import time
+        t0 = time.time()
+
+        # 2. 停止旧进程（如果还在跑）
+        stopped_info = {"stopped": True, "took_ms": 0, "forced": False}
+        if was_alive:
+            start = time.time()
+            stopped_info["stopped"] = _kill_tree(old_pid, force=force, timeout=timeout)
+            stopped_info["took_ms"] = int((time.time() - start) * 1000)
+            stopped_info["forced"] = force
+
+            if not stopped_info["stopped"]:
+                log_op({"tool": "service_restart", "name": name, "ok": False, "error": "停止失败"})
+                return json.dumps(
+                    {
+                        "name": name,
+                        "ok": False,
+                        "error": "停止旧进程失败（force=True 重试或手动 service_stop）",
+                        "before": {"pid": old_pid, "alive": True, "started_at": entry.get("started_at")},
+                        "stopped": stopped_info,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            # 从注册表移除旧条目（保留日志目录供事后排错 / 复用）
+            services = [s for s in _read_registry() if s.get("name") != name]
+            _write_registry(services)
+            try:
+                pid_path = _pid_file(name)
+                if os.path.exists(pid_path):
+                    os.remove(pid_path)
+            except OSError:
+                pass
+
+        # 3. 可选清空日志（HMR 卡死 / 想要干净日志）
+        if truncate_logs:
+            for log_file in (entry.get("stdout_log"), entry.get("stderr_log")):
+                if log_file and os.path.exists(log_file):
+                    try:
+                        os.truncate(log_file, 0)
+                    except OSError:
+                        pass
+
+        # 4. 解析并启动新进程（复用注册表里的原参数）
+        if not original_command.strip():
+            return f"错误：服务 {name!r} 注册表里没有 command，无法重启"
+
+        parts = _parse_command(original_command)
+        if not parts:
+            return f"错误：原命令解析为空：{original_command!r}"
+
+        cwd_abs = None
+        if original_cwd:
+            cwd_abs = os.path.abspath(original_cwd)
+            if not os.path.isdir(cwd_abs):
+                log_op({"tool": "service_restart", "name": name, "ok": False, "error": "原工作目录不存在"})
+                return f"错误：原工作目录不存在：{cwd_abs}"
+            try:
+                ensure_allowed(cwd_abs)
+            except ValueError as e:
+                log_op({"tool": "service_restart", "name": name, "ok": False, "error": str(e)})
+                return f"错误：{e}"
+
+        if original_log_dir:
+            logs_root = os.path.abspath(original_log_dir)
+            try:
+                ensure_allowed(logs_root)
+            except ValueError as e:
+                return f"错误：{e}"
+        else:
+            logs_root = os.path.join(_service_dir(name), "logs")
+        ensure_dir(logs_root)
+        stdout_path = os.path.join(logs_root, "stdout.log")
+        stderr_path = os.path.join(logs_root, "stderr.log")
+
+        proc = _spawn_detached(parts, cwd=cwd_abs, stdout_file=stdout_path, stderr_file=stderr_path)
+
+        ensure_dir(_service_dir(name))
+        pid_path = _pid_file(name)
+        try:
+            with open(pid_path, "w", encoding="utf-8") as f:
+                f.write(str(proc.pid))
+        except OSError as e:
+            return f"错误：写入 pid_file 失败：{e}"
+
+        new_entry = {
+            "name": name,
+            "pid": proc.pid,
+            "command": original_command,
+            "working_dir": cwd_abs,
+            "log_dir": logs_root,
+            "stdout_log": stdout_path,
+            "stderr_log": stderr_path,
+            "started_at": _now_iso(),
+        }
+        services = _read_registry()
+        services = [s for s in services if s.get("name") != name]
+        services.append(new_entry)
+        _write_registry(services)
+
+        # 短轮询：1 秒内死了就报错（避免"启动后立刻退出"被误认为运行中）
+        time.sleep(1.0)
+        if not _pid_alive(proc.pid):
+            services = [s for s in _read_registry() if s.get("name") != name]
+            _write_registry(services)
+            try:
+                os.remove(pid_path)
+            except OSError:
+                pass
+            log_op({"tool": "service_restart", "name": name, "ok": False, "error": "新进程立即退出"})
+            return (
+                f"错误：新进程 {name!r} 启动后立即退出（pid={proc.pid}）。"
+                f"请检查命令或查看日志：{stderr_path}"
+            )
+
+        elapsed_ms = int((time.time() - t0) * 1000)
+        result = {
+            "name": name,
+            "ok": True,
+            "before": {"pid": old_pid, "alive": was_alive, "started_at": entry.get("started_at")},
+            "stopped": stopped_info,
+            "started": new_entry,
+            "elapsed_ms": elapsed_ms,
+        }
+        log_op({"tool": "service_restart", "name": name, "new_pid": proc.pid, "ok": True})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_op({"tool": "service_restart", "name": name, "ok": False, "error": str(e)})
         return f"错误：{e}"
 
 

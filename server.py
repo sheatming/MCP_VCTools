@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover
 
 from mcp.server.mcpserver import MCPServer
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -1353,10 +1353,14 @@ def _command_wants_background(cmd):
     return None
 
 
-def _spawn_detached(args, cwd=None, stdout_file=None, stderr_file=None):
+def _spawn_detached(args, cwd=None, stdout_file=None, stderr_file=None, hide_window=False):
     """以"与父进程解耦"方式启动子进程，返回 Popen 对象。
     Windows：DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
-    Unix：start_new_session=True（脱离控制终端）
+      hide_window=True 时再叠加 CREATE_NO_WINDOW —— 关键：
+      光有 DETACHED_PROCESS 只是"不继承父控制台"，控制台子系统程序（python.exe /
+      node.exe / npm.cmd 等）仍会被系统新建一个控制台窗口，表现为黑窗一闪。
+      CREATE_NO_WINDOW 才是真正不创建窗口；对 GUI 子系统程序无影响（照常显示窗口）。
+    Unix：start_new_session=True（脱离控制终端），hide_window 无意义，忽略。
     日志文件：直接传二进制 file 对象。subprocess 通过 fd 直传给子进程，不创建内部 pipe/reader 线程，
     完全避开 TextIOWrapper 的 UTF-8 解码（子进程若输出含非法 UTF-8 字节不会崩）。"""
     popen_kwargs = {
@@ -1381,11 +1385,16 @@ def _spawn_detached(args, cwd=None, stdout_file=None, stderr_file=None):
         popen_kwargs["stderr"] = subprocess.DEVNULL
 
     if sys.platform == "win32":
-        popen_kwargs["creationflags"] = (
+        flags = (
             subprocess.DETACHED_PROCESS
             | subprocess.CREATE_NEW_PROCESS_GROUP
             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         )
+        if hide_window:
+            # 0x08000000：控制台子系统程序也不创建窗口（消除 dev server 的黑窗一闪）
+            # 注意：与 CREATE_NEW_CONSOLE 互斥，这里不会同时设置
+            flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        popen_kwargs["creationflags"] = flags
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -1399,6 +1408,7 @@ def launch_gui(
     wait: bool = False,
     wait_timeout: float = 0,
     name: str = "",
+    hide_window: bool = False,
 ) -> str:
     """启动一个 GUI 应用或一次性可执行程序。火即忘（不阻塞当前 MCP 调用）。
     command：要执行的命令字符串。按 shlex 拆分后传参——避免 shell 注入。
@@ -1409,8 +1419,11 @@ def launch_gui(
     name：可选。若传入则同时把进程纳入服务注册表（可被 service_status / service_logs / service_stop 管理），
       日志写入 ~/.coding-mcp/services/<name>/logs/。同一名字只能跑一个实例，重复会被拒绝。
       不传则纯火即忘——拿不回 PID 也没法清理。
+    hide_window：Windows 下是否隐藏控制台窗口（默认 False，与后台守护相反）。
+      GUI 程序本来就要露界面，所以默认显示；对 GUI 子系统程序设 True 也无副作用（窗口照常弹）。
+      若你启动的其实是控制台程序（如 npm.cmd / python 脚本）且不想要黑窗，传 True。
     ⚠️ 需开启 MCP_ENABLE_EXEC=1。
-    返回 JSON：{"pid":..., "command":..., "working_dir":..., "started_at":...,
+    返回 JSON：{"pid":..., "command":..., "working_dir":..., "hide_window":..., "started_at":...,
                "name"?:..., "log_files"?:{stdout,stderr}, "exit_code"?:..., "killed"?:...}"""
     if not EXEC_ENABLED:
         return "错误：命令执行未开启。请设置 MCP_ENABLE_EXEC=1。"
@@ -1469,16 +1482,20 @@ def launch_gui(
                 "cwd": cwd,
                 "wait": wait,
                 "name": name if registered else None,
+                "hide_window": hide_window,
                 "ok": None,
             }
         )
 
-        proc = _spawn_detached(parts, cwd=cwd, stdout_file=stdout_log, stderr_file=stderr_log)
+        proc = _spawn_detached(
+            parts, cwd=cwd, stdout_file=stdout_log, stderr_file=stderr_log, hide_window=hide_window,
+        )
 
         result = {
             "pid": proc.pid,
             "command": command,
             "working_dir": cwd,
+            "hide_window": bool(hide_window),
             "started_at": _now_iso(),
         }
 
@@ -1501,6 +1518,7 @@ def launch_gui(
                 "log_dir": logs_root,
                 "stdout_log": stdout_log,
                 "stderr_log": stderr_log,
+                "hide_window": bool(hide_window),
                 "started_at": result["started_at"],
             }
             services.append(entry)
@@ -1575,14 +1593,19 @@ def service_start(
     command: str,
     working_dir: str = "",
     log_dir: str = "",
+    hide_window: bool = True,
 ) -> str:
     """启动一个后台守护进程并托管其生命周期。
     name：服务标识（字母/数字/./_/-，最长 64 字符）。同一名字只能跑一个实例；重名且仍在运行会被拒绝。
     command：要执行的命令字符串。按 shlex 拆分后传参。
     working_dir：工作目录（可选，受 MCP_ALLOWED_ROOTS 约束）。
     log_dir：日志目录（可选，默认 ~/.coding-mcp/services/<name>/logs/，受 MCP_ALLOWED_ROOTS 约束）。
+    hide_window：Windows 下是否隐藏控制台窗口（默认 True）。
+      后台守护（dev server / 常驻脚本）默认隐藏，避免每次启动黑窗一闪。
+      叠加 CREATE_NO_WINDOW 实现；对 GUI 程序无影响。想看窗口就传 False。
     ⚠️ 需开启 MCP_ENABLE_EXEC=1。stdout/stderr 持续追加到日志文件，不会丢也不会撑爆上下文。
-    返回 JSON：{"name":..., "pid":..., "command":..., "working_dir":..., "log_files":{stdout,stderr}, "started_at":...}"""
+    返回 JSON：{"name":..., "pid":..., "command":..., "working_dir":..., "hide_window":...,
+               "log_files":{stdout,stderr}, "started_at":...}"""
     if not EXEC_ENABLED:
         return "错误：命令执行未开启。请设置 MCP_ENABLE_EXEC=1。"
     try:
@@ -1640,8 +1663,10 @@ def service_start(
         stdout_path = os.path.join(logs_root, "stdout.log")
         stderr_path = os.path.join(logs_root, "stderr.log")
 
-        log_op({"tool": "service_start", "name": name, "command": command, "cwd": cwd, "ok": None})
-        proc = _spawn_detached(parts, cwd=cwd, stdout_file=stdout_path, stderr_file=stderr_path)
+        log_op({"tool": "service_start", "name": name, "command": command, "cwd": cwd, "hide_window": hide_window, "ok": None})
+        proc = _spawn_detached(
+            parts, cwd=cwd, stdout_file=stdout_path, stderr_file=stderr_path, hide_window=hide_window,
+        )
 
         # 写 pid_file + 更新注册表（原子）
         ensure_dir(_service_dir(name))
@@ -1659,6 +1684,7 @@ def service_start(
             "log_dir": logs_root,
             "stdout_log": stdout_path,
             "stderr_log": stderr_path,
+            "hide_window": bool(hide_window),
             "started_at": _now_iso(),
         }
         services.append(entry)
@@ -1745,18 +1771,21 @@ def service_restart(
     force: bool = False,
     timeout: float = 10.0,
     truncate_logs: bool = False,
+    hide_window: bool | None = None,
 ) -> str:
     """重启一个由 service_start 启动的后台服务（stop + start 一步完成）。
     name：服务标识。
     force：是否强制停止（默认 False：先温和发信号，10 秒不退再强杀）。
     timeout：等待停止的秒数（默认 10）。
     truncate_logs：是否清空原 stdout/stderr 日志（默认 False 保留历史；HMR 卡死 / 想要干净日志时设 True）。
+    hide_window：Windows 下新进程是否隐藏控制台窗口。
+      None（默认）= 沿用注册表里该服务上次的设置；显式传 True/False 可临时覆盖并写回注册表。
     ⚠️ 需开启 MCP_ENABLE_EXEC=1。复用注册表里的原 command / working_dir / log_dir。
     返回 JSON：{
       name, ok: bool,
       before:  {pid, alive, started_at},       # 重启前
       stopped: {stopped, took_ms, forced},     # 旧进程的停止结果
-      started: {pid, started_at, command, working_dir, log_files}, # 新进程
+      started: {pid, started_at, command, working_dir, hide_window, log_files}, # 新进程
       elapsed_ms
     }"""
     if not EXEC_ENABLED:
@@ -1779,7 +1808,14 @@ def service_restart(
         old_pid = int(entry.get("pid", 0))
         was_alive = _pid_alive(old_pid)
 
-        log_op({"tool": "service_restart", "name": name, "old_pid": old_pid, "was_alive": was_alive, "ok": None})
+        # hide_window：None 表示沿用注册表原值（老条目无此字段时按后台守护语义默认 True=隐藏）
+        original_hide_window = bool(entry.get("hide_window", True))
+        effective_hide = original_hide_window if hide_window is None else bool(hide_window)
+
+        log_op({
+            "tool": "service_restart", "name": name, "old_pid": old_pid,
+            "was_alive": was_alive, "hide_window": effective_hide, "ok": None,
+        })
         import time
         t0 = time.time()
 
@@ -1856,7 +1892,10 @@ def service_restart(
         stdout_path = os.path.join(logs_root, "stdout.log")
         stderr_path = os.path.join(logs_root, "stderr.log")
 
-        proc = _spawn_detached(parts, cwd=cwd_abs, stdout_file=stdout_path, stderr_file=stderr_path)
+        proc = _spawn_detached(
+            parts, cwd=cwd_abs, stdout_file=stdout_path, stderr_file=stderr_path,
+            hide_window=effective_hide,
+        )
 
         ensure_dir(_service_dir(name))
         pid_path = _pid_file(name)
@@ -1874,6 +1913,7 @@ def service_restart(
             "log_dir": logs_root,
             "stdout_log": stdout_path,
             "stderr_log": stderr_path,
+            "hide_window": effective_hide,
             "started_at": _now_iso(),
         }
         services = _read_registry()

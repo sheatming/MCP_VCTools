@@ -81,10 +81,10 @@
 
 | 工具               | 作用                                 |
 | ---------------- | ---------------------------------- |
-| `launch_gui`     | 启动 GUI 应用或一次性可执行（默认火即忘，可选 `name` 参数纳入服务托管） |
-| `service_start`  | 启动一个后台守护进程并托管其生命周期（日志/PID/幂等） |
+| `launch_gui`     | 启动 GUI 应用或一次性可执行（默认火即忘，可选 `name` 参数纳入服务托管；`hide_window` 默认 False） |
+| `service_start`  | 启动一个后台守护进程并托管其生命周期（日志/PID/幂等；`hide_window` 默认 **True**，不闪黑窗） |
 | `service_stop`   | 停止后台服务（先温和、再强杀）                |
-| `service_restart`| 重启后台服务（stop + start 一步完成，复用注册表里的原 command / working_dir） |
+| `service_restart`| 重启后台服务（stop + start 一步完成，复用注册表里的原 command / working_dir / hide_window） |
 | `service_status` | 查询单个或所有托管服务的存活状态              |
 | `service_logs`   | 读取后台服务的 stdout/stderr 日志末尾       |
 | `service_clean`  | 扫描注册表，清理已死进程对应的孤儿条目         |
@@ -229,6 +229,42 @@ service_restart(name='web', truncate_logs=True)      # 同时清空 stdout/stder
 - `stopped`：停止是否成功、用了多少毫秒、是否强杀
 - `started`：新进程 PID / 启动时间 / 注册表完整条目
 - `ok=false`：停止失败时返回（保留旧进程，便于排查），新进程立即退出时返回错误文本（不会留半死状态）
+
+### 窗口可见性 `hide_window`（Windows）
+
+后台启动类进程默认会弹一个控制台黑窗（dev server 一闪一个）。三个启动类工具都支持 `hide_window` 控制：
+
+| 工具 | 默认值 | 语义 |
+| --- | --- | --- |
+| `service_start` | **`True`** | 后台守护默认隐藏，不闪黑窗 |
+| `launch_gui` | `False` | GUI 本来就要露界面，默认显示 |
+| `service_restart` | `None` | 沿用该服务上次的设置；显式传 `True`/`False` 则覆盖并写回注册表 |
+
+```
+service_start(name='web', command='npm run dev')            # 默认隐藏，无黑窗
+service_start(name='web', command='npm run dev', hide_window=False)  # 想看窗口
+
+launch_gui(command='my-app.exe')                            # GUI 照常显示
+launch_gui(command='npm.cmd run dev', hide_window=True)     # 控制台程序，别闪窗
+
+service_restart(name='web')                    # 沿用原设置
+service_restart(name='web', hide_window=False) # 这次要看窗口，并记住这个选择
+```
+
+**技术要点（Windows）**：光有 `DETACHED_PROCESS` **不够**——它只表示"不继承父控制台"，
+控制台子系统程序（`python.exe` / `node.exe` / `npm.cmd`）仍会被系统新建控制台窗口。
+必须叠加 `CREATE_NO_WINDOW` (0x08000000) 才真正不建窗口：
+
+```python
+flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+if hide_window:
+    flags |= CREATE_NO_WINDOW   # 0x08000000，真正消除黑窗
+```
+
+- 该 flag **仅影响控制台子系统程序**；GUI 程序（`notepad.exe`、Flutter GUI）窗口照常弹出
+- 与 `CREATE_NEW_CONSOLE` 互斥，本实现不会同时设置
+- Unix / macOS 无窗口概念，此参数被忽略
+- 窗口隐藏**不影响日志**——stdout/stderr 照常落盘，`service_logs` 正常读
 
 ### `service_clean` — 清理孤儿
 

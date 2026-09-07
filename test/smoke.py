@@ -736,6 +736,131 @@ async def test_service_restart():
         # 服务进程已显式 stop；不再需要 taskkill /IM。
 
 
+def test_hide_window_creationflags():
+    """底层验证：hide_window 是否真的把 CREATE_NO_WINDOW (0x08000000) 加到 creationflags。
+
+    窗口是否"可见"依赖桌面会话，沙箱里（Session 0）测不出来，
+    所以这里拦截 subprocess.Popen 直接检查传入的 flag —— 确定性、跨平台无关。
+
+    要点：光有 DETACHED_PROCESS 不够，控制台子系统程序（python/node/npm.cmd）
+    仍会被系统新建控制台窗口；必须叠加 CREATE_NO_WINDOW。
+    """
+    import subprocess as sp_mod
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import server
+
+    NO_WINDOW = 0x08000000
+    captured = []
+    real_popen = sp_mod.Popen
+
+    def fake_popen(*a, **kw):
+        captured.append(kw)
+        return real_popen(*a, **kw)
+
+    server.subprocess.Popen = fake_popen
+    try:
+        import sys as _sys
+        for hw in (True, False):
+            captured.clear()
+            p = server._spawn_detached([_sys.executable, "-c", "pass"], hide_window=hw)
+            p.wait()
+            flags = captured[0].get("creationflags", 0)
+            set_ = bool(flags & NO_WINDOW)
+            print(f"\n[hide_window={hw}] creationflags=0x{flags:08X}  NO_WINDOW={set_}")
+            assert set_ is hw, f"hide_window={hw} 时 NO_WINDOW 应为 {hw}，实际 {set_}"
+    finally:
+        server.subprocess.Popen = real_popen
+
+
+async def test_hide_window_defaults():
+    """端到端验证 hide_window 的默认值语义：
+      - service_start 默认 True（后台守护不该闪黑窗）
+      - launch_gui   默认 False（GUI 本来就要露界面）
+      - service_restart 不传 = 沿用注册表原值；显式传则覆盖并写回
+    """
+    import time as time_mod
+
+    here = Path(__file__).resolve().parent.parent
+    server_py = here / "server.py"
+    python = here / ".venv" / "Scripts" / "python.exe"
+    if not python.exists():
+        python = here / ".venv" / "bin" / "python"
+
+    fake_home = tempfile.mkdtemp(prefix="coding-mcp-home-hidewin-")
+    audit = os.path.join(fake_home, "audit.log")
+    os.makedirs(os.path.join(fake_home, "services"), exist_ok=True)
+
+    params = StdioServerParameters(
+        command=str(python),
+        args=[str(server_py)],
+        env={
+            **os.environ,
+            "HOME": fake_home, "USERPROFILE": fake_home,
+            "MCP_AUDIT_LOG": audit, "MCP_ENABLE_EXEC": "1",
+        },
+    )
+    try:
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                sleep_cmd = f'"{python}" -c "import time; time.sleep(120)"'
+
+                # ---- 1. service_start 默认应 hide_window=True ----
+                r = await session.call_tool("service_start", {"name": "hw-default", "command": sleep_cmd})
+                entry = _json.loads(_text(r))
+                print("\n[svc-default] hide_window =", entry.get("hide_window"))
+                assert entry["hide_window"] is True, "service_start 默认应隐藏窗口"
+
+                # ---- 2. 显式 False ----
+                r = await session.call_tool(
+                    "service_start", {"name": "hw-shown", "command": sleep_cmd, "hide_window": False},
+                )
+                entry = _json.loads(_text(r))
+                print("[svc-false  ] hide_window =", entry.get("hide_window"))
+                assert entry["hide_window"] is False
+
+                # ---- 3. launch_gui 默认应 False ----
+                r = await session.call_tool(
+                    "launch_gui", {"command": sleep_cmd, "name": "hw-gui"},
+                )
+                entry = _json.loads(_text(r))
+                print("[gui-default] hide_window =", entry.get("hide_window"))
+                assert entry["hide_window"] is False, "launch_gui 默认应显示窗口"
+
+                # ---- 4. service_restart 不传 → 沿用原值 ----
+                r = await session.call_tool("service_restart", {"name": "hw-shown"})
+                res = _json.loads(_text(r))
+                print("[restart-keep] hide_window =", res["started"].get("hide_window"),
+                      "(原值 False)")
+                assert res["ok"] is True
+                assert res["started"]["hide_window"] is False, "不传时应沿用原值 False"
+
+                r = await session.call_tool("service_restart", {"name": "hw-default"})
+                res = _json.loads(_text(r))
+                print("[restart-keep] hide_window =", res["started"].get("hide_window"),
+                      "(原值 True)")
+                assert res["started"]["hide_window"] is True, "不传时应沿用原值 True"
+
+                # ---- 5. service_restart 显式覆盖 ----
+                r = await session.call_tool(
+                    "service_restart", {"name": "hw-shown", "hide_window": True},
+                )
+                res = _json.loads(_text(r))
+                print("[restart-override] hide_window =", res["started"].get("hide_window"))
+                assert res["started"]["hide_window"] is True, "显式传 True 应覆盖"
+                # 覆盖后应写回注册表：再重启一次（不传）应保持 True
+                r = await session.call_tool("service_restart", {"name": "hw-shown"})
+                res = _json.loads(_text(r))
+                assert res["started"]["hide_window"] is True, "覆盖后应写回注册表"
+                print("[restart-persist] hide_window =", res["started"].get("hide_window"))
+
+                # ---- 6. 清理 ----
+                for n in ("hw-default", "hw-shown", "hw-gui"):
+                    await session.call_tool("service_stop", {"name": n, "force": True})
+    finally:
+        shutil.rmtree(fake_home, ignore_errors=True)
+
+
 async def test_api_request_and_assert():
     """API 测试：发请求 + 多类型断言 + 错误处理。"""
     import json as _json
@@ -1346,6 +1471,8 @@ if __name__ == "__main__":
     asyncio.run(test_launch_gui_with_name())
     asyncio.run(test_service_clean())
     asyncio.run(test_service_restart())
+    test_hide_window_creationflags()
+    asyncio.run(test_hide_window_defaults())
     asyncio.run(test_api_request_and_assert())
     asyncio.run(test_api_save_response())
     asyncio.run(test_ssh_exec_via_local_sshd())
